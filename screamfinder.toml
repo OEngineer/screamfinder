@@ -1,0 +1,60 @@
+# screamfinder configuration
+# All values here are defaults; command-line arguments always override them.
+
+# Output HTML report file
+output = "screamfinder.html"
+
+# Detection threshold: a frame is counted as vocal when its band energy
+# exceeds this multiplier × the median band energy for that file.
+# Higher values = fewer (but more confident) detections.
+threshold = 4.0
+
+# Analyze only the last N seconds of each file (0 = analyze the full file).
+# Useful when videos end with credits/silence or you only care about the finale.
+clip_duration = 0
+
+# Minimum continuous vocalization duration (seconds).
+# Vocal bursts shorter than this are ignored — only sustained vocalizations
+# count toward the percentages. Set to 0 to count every detected frame.
+min_vocal_duration = 0.5
+
+# Frequency ranges for vocalization detection (Hz)
+female_freq = [500.0, 2000.0]
+male_freq   = [80.0, 200.0]
+
+# Audio sample rate used for analysis.
+# Nyquist frequency = sample_rate / 2 — must exceed female_freq[1].
+# Lower values use less memory and are faster; 11025 is a good default.
+sample_rate = 11025
+
+# STFT window size in samples (power of 2).
+# Larger = finer frequency resolution but slower. 1024 → ~10.8 Hz/bin at 11025 Hz.
+n_fft = 1024
+
+# STFT hop size in samples (distance between consecutive frames).
+# Larger = fewer frames per second → faster. At 11025 Hz, hop=1024 gives ~10.8 frames/sec
+# (93ms time resolution), which is well above what's needed for 0.5s+ vocalizations.
+hop_length = 1024
+
+# Number of files to analyze in parallel
+jobs = 4
+
+# Analysis result cache file (relative to the working directory)
+cache = ".screamfinder-cache.json"
+
+# Set to true to disable caching entirely
+no_cache = false
+
+# Set to true to re-analyze all files even when a cached result exists
+force = false
+
+# Silence gate: files with whole-file RMS below this value are scored 0%.
+# Audio from ffmpeg is normalised to [-1, 1]; 0.005 ≈ -46 dBFS.
+# Set to 0 to disable the gate entirely.
+min_audio_rms = 0.005
+
+# Percentile (0–50) of per-band frame energy used as the noise floor reference.
+# A constant background hiss or music bed will set this floor; vocalizations
+# must be 'threshold' times louder than it to be counted.
+# Lower values → more sensitive to brief bursts; higher → ignores quiet noise better.
+noise_floor_pct = 10.0
