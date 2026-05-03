@@ -32,11 +32,22 @@ sudo apt install ffmpeg
 
 ### 2. Install Python dependencies
 
+Use a virtual environment (recommended on macOS with Homebrew Python, which blocks `pip install` into the system interpreter):
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+If you prefer a global install and your Python allows it:
+
 ```bash
 pip install numpy scipy
 ```
 
 If you are on Python 3.8–3.10 and want config file support, also install:
+
 ```bash
 pip install tomli
 ```
@@ -48,7 +59,7 @@ git clone <repo-url>
 cd screamfinder
 ```
 
-No further build step is needed. Run directly with `python3 screamfinder.py`.
+Run with the venv activated (`python3 screamfinder.py …`), or invoke the interpreter explicitly: `.venv/bin/python screamfinder.py …`.
 
 ---
 
