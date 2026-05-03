@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-screamfinder - Analyzes video files for audible male/female vocalizations.
+screamfinder - Analyzes audio and video files for audible male/female vocalizations.
 
-Detects and quantifies vocalizations in video files and generates an
-interactive HTML report with a built-in video player.
+Detects and quantifies vocalizations in media files (video or audio) and
+generates an interactive HTML report with a built-in player.
 
 Requirements:
     pip install numpy scipy
@@ -14,8 +14,8 @@ Usage:
 
 Examples:
     python3 screamfinder.py ~/Videos/ -o report.html
-    python3 screamfinder.py clip1.mp4 clip2.mkv --threshold 2.0
-    python3 screamfinder.py ~/Videos/ --female-freq 300 2500 --male-freq 80 600
+    python3 screamfinder.py clip1.mp4 song.mp3 --threshold 2.0
+    python3 screamfinder.py ~/Media/ --female-freq 300 2500 --male-freq 80 600
 """
 
 import argparse
@@ -48,6 +48,18 @@ VIDEO_EXTENSIONS = frozenset({
     ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".3gp",
     ".m2ts", ".mts", ".vob", ".divx",
 })
+
+AUDIO_EXTENSIONS = frozenset({
+    ".mp3", ".wav", ".ogg", ".oga", ".opus",
+    ".m4a", ".aac", ".flac",
+})
+
+MEDIA_EXTENSIONS = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
+
+
+def media_kind(path: Path) -> str:
+    """Return "audio" if path's suffix is a known audio extension, else "video"."""
+    return "audio" if path.suffix.lower() in AUDIO_EXTENSIONS else "video"
 
 # ---------------------------------------------------------------------------
 # Embedded CSS
@@ -304,6 +316,45 @@ tr:hover td { background: var(--surface2); }
   cursor: pointer;
 }
 
+/* Audio placeholder (shown when an audio file is loaded into the video element) */
+.audio-cover {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  background: linear-gradient(160deg, #1a1a26 0%, #0d0d14 100%);
+  color: var(--dim);
+  text-align: center;
+  padding: 24px;
+  pointer-events: none;
+  z-index: 5;
+}
+.audio-cover.hidden { display: none; }
+.audio-cover-icon {
+  font-size: 96px;
+  line-height: 1;
+  color: var(--pinkf);
+  opacity: 0.55;
+  text-shadow: 0 4px 24px rgba(233, 30, 140, 0.35);
+}
+.audio-cover-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  color: #bbb;
+  max-width: 80%;
+  word-break: break-all;
+}
+
+/* When an audio file is loaded the <video> element has no intrinsic size;
+   give the player a sensible minimum height so the cover has room to render. */
+.player-wrap.is-audio #player {
+  min-height: 320px;
+  height: 320px;
+}
+
 /* Format error overlay */
 .player-error {
   position: absolute;
@@ -517,13 +568,14 @@ function renderTable() {
     const femTxt = item.female_pct >= 0 ? item.female_pct.toFixed(1) + '%' : '—';
     const malTxt = item.male_pct   >= 0 ? item.male_pct.toFixed(1)   + '%' : '—';
 
+    const icon = item.kind === 'audio' ? '\u266A' : '\u25B6';
     return `<tr>
       <td class="rank-cell">${rank + 1}</td>
       <td>
         <a class="name-link" href="#"
            data-idx="${item._idx}"
            onclick="openPlayer(${item._idx});return false;">
-          <span class="play-icon">▶</span>
+          <span class="play-icon">${icon}</span>
           <span class="filename-text" title="${esc(item.name)}">${esc(item.name)}</span>
         </a>
       </td>
@@ -580,6 +632,8 @@ const playerControls = document.getElementById('player-controls');
 const playerError     = document.getElementById('player-error');
 const playerErrDetail = document.getElementById('player-error-detail');
 const playerErrPath   = document.getElementById('player-error-path');
+const audioCover      = document.getElementById('audio-cover');
+const audioCoverName  = document.getElementById('audio-cover-name');
 const progressTrack  = document.getElementById('progress-track');
 const progressFill   = document.getElementById('progress-fill');
 const progressBuf    = document.getElementById('progress-buf');
@@ -597,9 +651,13 @@ let hideCtrlTimer = null;
 // Open / close
 function openPlayer(idx) {
   const item = DATA[idx];
+  const isAudio = item.kind === 'audio';
   document.getElementById('player-title').textContent = item.name;
   playerError.classList.add('hidden');
   playerControls.style.display = '';
+  playerWrap.classList.toggle('is-audio', isAudio);
+  audioCover.classList.toggle('hidden', !isAudio);
+  audioCoverName.textContent = isAudio ? item.name : '';
   video.src = item.url;
   modal.classList.remove('hidden');
   document.body.style.overflow = 'hidden';
@@ -641,6 +699,9 @@ function closePlayer() {
   document.body.style.overflow = '';
   playerError.classList.add('hidden');
   playerControls.style.display = '';
+  playerWrap.classList.remove('is-audio');
+  audioCover.classList.add('hidden');
+  audioCoverName.textContent = '';
   clearTimeout(hideCtrlTimer);
 }
 
@@ -881,6 +942,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <button class="hdr-btn" onclick="closePlayer()" title="Close (Esc)">✕</button>
     </div>
     <video id="player" preload="metadata"></video>
+    <div id="audio-cover" class="audio-cover hidden">
+      <div class="audio-cover-icon">&#9835;</div>
+      <div id="audio-cover-name" class="audio-cover-name"></div>
+    </div>
     <div id="player-error" class="player-error hidden">
       <div class="err-icon">⚠</div>
       <div class="err-title">This file cannot be played in the browser</div>
@@ -932,30 +997,30 @@ const DATA = <<<DATA_JSON>>>;
 # Core analysis functions
 # ---------------------------------------------------------------------------
 
-def find_video_files(paths: List[str]) -> List[Path]:
-    """Recursively find video files in given paths."""
+def find_media_files(paths: List[str]) -> List[Path]:
+    """Recursively find media (video or audio) files in given paths."""
     found: List[Path] = []
     for p_str in paths:
         p = Path(p_str).expanduser().resolve()
         if p.is_file():
-            if p.suffix.lower() in VIDEO_EXTENSIONS:
+            if p.suffix.lower() in MEDIA_EXTENSIONS:
                 found.append(p)
         elif p.is_dir():
             for child in p.rglob("*"):
-                if child.is_file() and child.suffix.lower() in VIDEO_EXTENSIONS:
+                if child.is_file() and child.suffix.lower() in MEDIA_EXTENSIONS:
                     found.append(child)
         else:
             print(f"WARNING: path not found: {p}", file=sys.stderr)
     return sorted(set(found))
 
 
-def get_video_duration(video_path: Path) -> Optional[float]:
-    """Return video duration in seconds via ffprobe."""
+def get_media_duration(media_path: Path) -> Optional[float]:
+    """Return media (video or audio) duration in seconds via ffprobe."""
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
         "-of", "json",
-        str(video_path),
+        str(media_path),
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -1166,7 +1231,7 @@ def _analyze_worker(video_path_str: str, params: Dict[str, object]) -> Dict[str,
     extract_dur: Optional[float] = None
     reported_duration: Optional[float] = None   # full file duration when clipping
     if clip_duration > 0:
-        full_dur = get_video_duration(video_path) or 0.0
+        full_dur = get_media_duration(video_path) or 0.0
         reported_duration = full_dur
         if full_dur > clip_duration:
             start_sec   = full_dur - clip_duration
@@ -1176,7 +1241,7 @@ def _analyze_worker(video_path_str: str, params: Dict[str, object]) -> Dict[str,
     audio = extract_audio(video_path, sample_rate, start_sec=start_sec, duration_sec=extract_dur)
     if audio is None:
         # Audio extraction failed; fall back to ffprobe for duration.
-        duration = reported_duration or get_video_duration(video_path) or 0.0
+        duration = reported_duration or get_media_duration(video_path) or 0.0
         return {"duration": duration, "female_pct": -1.0, "male_pct": -1.0}
 
     # Use ffprobe-reported full duration when clipping; otherwise derive from audio.
@@ -1195,6 +1260,7 @@ def _make_result(video_path: Path, data: Dict[str, object], cached: bool) -> dic
         "path":       str(video_path),
         "url":        video_path.as_uri(),
         "name":       video_path.name,
+        "kind":       media_kind(video_path),
         "duration":   data.get("duration"),
         "female_pct": data.get("female_pct", -1.0),
         "male_pct":   data.get("male_pct",   -1.0),
@@ -1215,6 +1281,7 @@ def generate_html(results: List[dict], args: argparse.Namespace) -> str:
         js_data.append({
             "name":         r["name"],
             "url":          r["url"],
+            "kind":         r.get("kind", "video"),
             "duration":     round(dur, 3),
             "duration_fmt": format_duration(r["duration"]),
             "female_pct":   round(max(r["female_pct"], 0), 2),
@@ -1330,12 +1397,12 @@ def main() -> None:
 
     # ── Step 2: main parser ───────────────────────────────────────────────────
     parser = argparse.ArgumentParser(
-        description="Analyze video files for audible vocalizations and generate an HTML report.",
+        description="Analyze audio and video files for audible vocalizations and generate an HTML report.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "paths", nargs="+", metavar="PATH",
-        help="Video file(s) and/or directory(s) to analyze",
+        help="Media file(s) (video or audio) and/or directory(s) to analyze",
     )
     parser.add_argument(
         "--config", default="screamfinder.toml", metavar="FILE",
@@ -1435,12 +1502,12 @@ def main() -> None:
     check_dependency("ffprobe")
 
     # Find files
-    video_files = find_video_files(args.paths)
-    if not video_files:
-        print("No video files found.", file=sys.stderr)
+    media_files = find_media_files(args.paths)
+    if not media_files:
+        print("No media files found.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Found {len(video_files)} video file(s).", file=sys.stderr)
+    print(f"Found {len(media_files)} media file(s).", file=sys.stderr)
 
     # Cache
     cache_path: Optional[Path] = None
@@ -1464,10 +1531,10 @@ def main() -> None:
     }
 
     # Pre-check cache in the main process; only submit uncached files to workers.
-    results: List[dict] = [None] * len(video_files)  # type: ignore[list-item]
+    results: List[dict] = [None] * len(media_files)  # type: ignore[list-item]
     to_run: List[Tuple[int, Path]] = []
     completed = 0
-    n_total = len(video_files)
+    n_total = len(media_files)
 
     def _print_progress(name: str, data: Dict[str, object], cached: bool) -> None:
         nonlocal completed
@@ -1484,7 +1551,7 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    for i, vp in enumerate(video_files):
+    for i, vp in enumerate(media_files):
         key = _cache_key(vp, params)
         if not args.force and key in cache:
             data = cache[key]

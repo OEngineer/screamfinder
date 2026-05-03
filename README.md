@@ -1,6 +1,6 @@
 # ScreamFinder
 
-Analyzes video files for audible male and female vocalizations and generates an interactive HTML report with a built-in video player.
+Analyzes audio and video files for audible male and female vocalizations and generates an interactive HTML report with a built-in player.
 
 Each file gets a **Female %** (fraction of time with detectable female-range vocalizations), a **Male %**, and a composite **Score** whose weights you can adjust live with sliders in the report.
 
@@ -55,11 +55,11 @@ No further build step is needed. Run directly with `python3 screamfinder.py`.
 ## Quick Start
 
 ```bash
-# Analyze all video files in a directory
-python3 screamfinder.py ~/Videos/ -o report.html
+# Analyze all media files in a directory (video and/or audio)
+python3 screamfinder.py ~/Media/ -o report.html
 
-# Analyze specific files
-python3 screamfinder.py clip1.mp4 clip2.mkv -o report.html
+# Analyze specific files (mix and match video and audio)
+python3 screamfinder.py clip1.mp4 song.mp3 podcast.flac -o report.html
 
 # Open the report
 open report.html          # macOS
@@ -83,18 +83,20 @@ The report shows a sortable table with one row per file:
 | **Male %** | Percentage of frames with sustained male-range vocalizations |
 | **Score** | Weighted composite; adjust weights with the sliders at the top |
 
-### Video Player
+### Player
 
 Click any filename to open a full-screen modal player with:
 
 - Click or **Space** / **K** — play / pause
 - **← →** — seek ±5 seconds; **Shift + ← →** — seek ±30 seconds
-- **↑ ↓** — volume; **M** — mute; scroll wheel over video — volume
+- **↑ ↓** — volume; **M** — mute; scroll wheel over the player — volume
 - **F** or double-click — fullscreen
 - **0–9** — jump to 0%–90% of the file
 - **Esc** — close
 
-If a file format isn't supported by the browser (e.g. `.mpg`, `.avi`), an error overlay appears with the file path and a **Copy path** button so you can paste it into VLC, IINA, or another player.
+Audio files (`.mp3`, `.flac`, etc.) play in the same modal: instead of a video frame they show a static placeholder with the filename, but every keybinding and control above still applies. A small ♪ icon next to the filename in the table indicates audio rows.
+
+If a file format isn't supported by the browser (e.g. `.mpg`, `.avi`, `.wma`), an error overlay appears with the file path and a **Copy path** button so you can paste it into VLC, IINA, or another player.
 
 ---
 
@@ -104,7 +106,7 @@ If a file format isn't supported by the browser (e.g. `.mpg`, `.avi`), an error 
 python3 screamfinder.py [options] PATH [PATH ...]
 ```
 
-`PATH` can be a video file or a directory (searched recursively). Multiple paths are accepted.
+`PATH` can be a media file (video or audio) or a directory (searched recursively). Multiple paths are accepted.
 
 ### Core options
 
@@ -176,11 +178,13 @@ By default, `screamfinder.py` looks for `screamfinder.toml` in the current direc
 
 ---
 
-## Supported Video Formats
+## Supported Formats
 
-`.mp4` `.avi` `.mkv` `.mov` `.wmv` `.flv` `.webm` `.m4v` `.mpg` `.mpeg` `.ts` `.3gp` `.m2ts` `.mts` `.vob` `.divx`
+**Video:** `.mp4` `.avi` `.mkv` `.mov` `.wmv` `.flv` `.webm` `.m4v` `.mpg` `.mpeg` `.ts` `.3gp` `.m2ts` `.mts` `.vob` `.divx`
 
-Directories are searched recursively. Any format ffmpeg can decode will work for analysis, but only formats the browser supports natively (MP4/H.264, WebM, Ogg) will play directly in the report. Other formats show a path-copy overlay for use with an external player.
+**Audio:** `.mp3` `.wav` `.ogg` `.oga` `.opus` `.m4a` `.aac` `.flac`
+
+Directories are searched recursively. Any format ffmpeg can decode will work for analysis, but only formats the browser supports natively (MP4/H.264, WebM, Ogg, MP3, WAV, FLAC, AAC) will play directly in the report. Other formats — or audio files with exotic codecs inside an `.m4a`/`.aac` container — show a path-copy overlay so you can open them in VLC, IINA, or another external player.
 
 ---
 
@@ -211,8 +215,8 @@ Directories are searched recursively. Any format ffmpeg can decode will work for
 **Quiet files scored as 0%:**
 - Lower or disable `--min-audio-rms` (`--min-audio-rms 0`)
 
-**Only care about the climax of each video:**
-- Use `--clip-duration 5:00` to analyze only the last 5 minutes
+**Only care about the climax of each file:**
+- Use `--clip-duration 5:00` to analyze only the last 5 minutes (works for both audio and video)
 
 **Speed up analysis of a large collection:**
 - Raise `--jobs` to match your CPU core count
