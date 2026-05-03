@@ -103,9 +103,10 @@ Click any filename to open a full-screen modal player with:
 - **↑ ↓** — volume; **M** — mute; scroll wheel over the player — volume
 - **F** or double-click — fullscreen
 - **0–9** — jump to 0%–90% of the file
+- **Auto next** — when enabled, the next visible row starts automatically when the current file ends
 - **Esc** — close
 
-Audio files (`.mp3`, `.flac`, etc.) play in the same modal: instead of a video frame they show a static placeholder with the filename, but every keybinding and control above still applies. A small ♪ icon next to the filename in the table indicates audio rows.
+Audio files (`.mp3`, `.flac`, etc.) play in the same modal: instead of a video frame they show a static placeholder with the filename. The **timeline** and **volume** slider sit in the bar below that artwork (they stay visible while audio plays—no auto-hide). Scroll the mouse wheel over the artwork or video area to change volume. A small ♪ icon next to the filename in the table indicates audio rows.
 
 If a file format isn't supported by the browser (e.g. `.mpg`, `.avi`, `.wma`), an error overlay appears with the file path and a **Copy path** button so you can paste it into VLC, IINA, or another player.
 

@@ -308,6 +308,13 @@ tr:hover td { background: var(--surface2); }
 }
 .hdr-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
 
+/* Video / audio viewport only — keeps the cover from overlapping the control bar */
+.player-media {
+  position: relative;
+  flex-shrink: 0;
+  background: #000;
+}
+
 #player {
   width: 100%;
   max-height: 80vh;
@@ -349,7 +356,10 @@ tr:hover td { background: var(--surface2); }
 }
 
 /* When an audio file is loaded the <video> element has no intrinsic size;
-   give the player a sensible minimum height so the cover has room to render. */
+   give the media area a sensible minimum height so the cover has room to render. */
+.player-wrap.is-audio .player-media {
+  min-height: 320px;
+}
 .player-wrap.is-audio #player {
   min-height: 320px;
   height: 320px;
@@ -488,6 +498,11 @@ tr:hover td { background: var(--surface2); }
   flex-shrink: 0;
 }
 .ctrl-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
+.ctrl-btn.active {
+  background: var(--pinkf);
+  color: #fff;
+  font-weight: 700;
+}
 
 .vol-slider {
   width: 80px;
@@ -537,6 +552,7 @@ function computeScore(item, w) {
 
 let sortCol = 'score';
 let sortAsc  = false;
+let playlistOrder = DATA.map((_, idx) => idx);
 
 function esc(s) {
   return String(s)
@@ -561,6 +577,7 @@ function renderTable() {
   const maxScore = Math.max(...rows.map(r => r.score), 0.001);
 
   const tbody = document.getElementById('tbody');
+  playlistOrder = rows.map(item => item._idx);
   tbody.innerHTML = rows.map((item, rank) => {
     const scoreNorm = (item.score / maxScore) * 100;
     const femW = Math.min(item.female_pct, 100);
@@ -634,6 +651,7 @@ const playerErrDetail = document.getElementById('player-error-detail');
 const playerErrPath   = document.getElementById('player-error-path');
 const audioCover      = document.getElementById('audio-cover');
 const audioCoverName  = document.getElementById('audio-cover-name');
+const playerMedia     = document.querySelector('.player-media');
 const progressTrack  = document.getElementById('progress-track');
 const progressFill   = document.getElementById('progress-fill');
 const progressBuf    = document.getElementById('progress-buf');
@@ -641,17 +659,21 @@ const progressThumb  = document.getElementById('progress-thumb');
 const timeCurEl      = document.getElementById('time-cur');
 const timeTotEl      = document.getElementById('time-tot');
 const playBtn        = document.getElementById('btn-play');
+const autoNextBtn    = document.getElementById('btn-auto-next');
 const muteBtn        = document.getElementById('btn-mute');
 const volSlider      = document.getElementById('vol-track');
 
 let isDragging    = false;
 let savedVol      = 1;
 let hideCtrlTimer = null;
+let currentItemIdx = null;
+let autoNext       = false;
 
 // Open / close
 function openPlayer(idx) {
   const item = DATA[idx];
   const isAudio = item.kind === 'audio';
+  currentItemIdx = idx;
   document.getElementById('player-title').textContent = item.name;
   playerError.classList.add('hidden');
   playerControls.style.display = '';
@@ -702,6 +724,9 @@ function closePlayer() {
   playerWrap.classList.remove('is-audio');
   audioCover.classList.add('hidden');
   audioCoverName.textContent = '';
+  currentItemIdx = null;
+  autoNext = false;
+  updateAutoNextButton();
   clearTimeout(hideCtrlTimer);
 }
 
@@ -712,6 +737,8 @@ function showControls() {
   playerControls.classList.remove('hidden-ctrl');
   playerWrap.classList.remove('hide-cursor');
   clearTimeout(hideCtrlTimer);
+  // Audio has no video frame to "wake" the UI — keep scrubber + volume visible.
+  if (playerWrap.classList.contains('is-audio')) return;
   if (!video.paused) {
     hideCtrlTimer = setTimeout(() => {
       playerControls.classList.add('hidden-ctrl');
@@ -721,8 +748,10 @@ function showControls() {
 }
 
 playerWrap.addEventListener('mousemove', showControls);
+playerMedia.addEventListener('mousemove', showControls);
 video.addEventListener('play',  () => {
   playBtn.textContent = '⏸';
+  if (playerWrap.classList.contains('is-audio')) return;
   hideCtrlTimer = setTimeout(() => {
     playerControls.classList.add('hidden-ctrl');
     playerWrap.classList.add('hide-cursor');
@@ -738,6 +767,30 @@ video.addEventListener('pause', () => {
 function togglePlay() {
   if (video.paused) video.play().catch(() => {});
   else video.pause();
+}
+
+function updateAutoNextButton() {
+  autoNextBtn.classList.toggle('active', autoNext);
+  autoNextBtn.setAttribute('aria-pressed', autoNext ? 'true' : 'false');
+  autoNextBtn.textContent = autoNext ? 'Auto next: On' : 'Auto next: Off';
+  autoNextBtn.title = autoNext
+    ? 'Auto-play next file: on'
+    : 'Auto-play next file: off';
+}
+
+function toggleAutoNext() {
+  autoNext = !autoNext;
+  updateAutoNextButton();
+  showControls();
+}
+
+function playNextInSequence() {
+  if (currentItemIdx === null) return false;
+  const pos = playlistOrder.indexOf(currentItemIdx);
+  const nextIdx = pos >= 0 ? playlistOrder[pos + 1] : currentItemIdx + 1;
+  if (nextIdx === undefined || nextIdx >= DATA.length) return false;
+  openPlayer(nextIdx);
+  return true;
 }
 
 function seek(delta) {
@@ -820,17 +873,19 @@ document.addEventListener('mouseup',   () => { isDragging = false; });
 
 video.addEventListener('timeupdate',    updateProgress);
 video.addEventListener('durationchange', updateProgress);
+video.addEventListener('ended',         () => { if (autoNext) playNextInSequence(); });
 video.addEventListener('click',         () => { togglePlay(); showControls(); });
 video.addEventListener('dblclick',      reqFullscreen);
 
-// Mouse wheel → volume
-video.addEventListener('wheel', e => {
+// Mouse wheel → volume (video element and whole media area for audio-only playback)
+function wheelVolume(e) {
   e.preventDefault();
   video.muted  = false;
   video.volume = Math.max(0, Math.min(1, video.volume + (e.deltaY < 0 ? 0.05 : -0.05)));
   updateMuteIcon();
   showControls();
-}, { passive: false });
+}
+playerMedia.addEventListener('wheel', wheelVolume, { passive: false });
 
 // Keyboard
 document.addEventListener('keydown', e => {
@@ -869,6 +924,7 @@ document.addEventListener('keydown', e => {
 });
 
 // Init
+updateAutoNextButton();
 renderTable();
 """
 
@@ -941,12 +997,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <span id="player-title" class="player-title"></span>
       <button class="hdr-btn" onclick="closePlayer()" title="Close (Esc)">✕</button>
     </div>
-    <video id="player" preload="metadata"></video>
-    <div id="audio-cover" class="audio-cover hidden">
-      <div class="audio-cover-icon">&#9835;</div>
-      <div id="audio-cover-name" class="audio-cover-name"></div>
-    </div>
-    <div id="player-error" class="player-error hidden">
+    <div class="player-media">
+      <video id="player" preload="metadata"></video>
+      <div id="audio-cover" class="audio-cover hidden">
+        <div class="audio-cover-icon">&#9835;</div>
+        <div id="audio-cover-name" class="audio-cover-name"></div>
+      </div>
+      <div id="player-error" class="player-error hidden">
       <div class="err-icon">⚠</div>
       <div class="err-title">This file cannot be played in the browser</div>
       <div id="player-error-detail" class="err-detail"></div>
@@ -956,6 +1013,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         Paste this path into VLC, IINA, QuickTime, or any other media player.<br>
         Browsers only support MP4/H.264, WebM, and Ogg natively.
       </div>
+    </div>
     </div>
     <div id="player-controls" class="player-controls">
       <div class="progress-area">
@@ -973,6 +1031,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <button class="ctrl-btn" onclick="seek(-5)"  title="Back 5s (←)">⏪ 5s</button>
         <button class="ctrl-btn" onclick="seek(5)"   title="Fwd 5s (→)">5s ⏩</button>
         <button class="ctrl-btn" onclick="seek(30)"  title="Fwd 30s (Shift+→)">30s ⏭</button>
+        <button id="btn-auto-next" class="ctrl-btn" onclick="toggleAutoNext()" title="Auto-play next file: off" aria-pressed="false">Auto next: Off</button>
         <span class="spacer"></span>
         <button id="btn-mute" class="ctrl-btn" onclick="toggleMute()" title="Mute (M)">🔊</button>
         <input type="range" id="vol-track" class="vol-slider" min="0" max="1" step="0.02" value="1">
