@@ -1659,18 +1659,37 @@ def _segments_from_scores(
     return 100.0 * float(np.mean(active)), segments
 
 
+def _yamnet_top_labels(
+    row_scores: np.ndarray,
+    class_names: List[str],
+    top_k: int,
+) -> List[dict]:
+    if row_scores.size == 0 or top_k <= 0:
+        return []
+    k = min(top_k, row_scores.size)
+    idxs = np.argpartition(row_scores, -k)[-k:]
+    idxs = idxs[np.argsort(row_scores[idxs])[::-1]]
+    return [
+        {"label": class_names[int(idx)], "score": round(float(row_scores[int(idx)]), 4)}
+        for idx in idxs
+    ]
+
+
 def analyze_yamnet_streaming(
     video_path: Path,
     model_handle: str,
     score_threshold: float,
     start_sec: float = 0.0,
     duration_sec: Optional[float] = None,
+    collect_debug: bool = False,
+    top_k: int = 8,
 ) -> Dict[str, object]:
     """Run YAMNet on streaming audio chunks and emit scream/moan segments."""
     resources = _load_yamnet_resources(model_handle)
     tf = resources["tf"]  # type: ignore[assignment]
     model = resources["model"]
     class_index = resources["class_index"]  # type: ignore[assignment]
+    class_names = resources["class_names"]  # type: ignore[assignment]
 
     frame_hop_sec = YAMNET_PATCH_HOP_SECONDS
     frame_span_sec = YAMNET_PATCH_WINDOW_SECONDS
@@ -1680,8 +1699,10 @@ def analyze_yamnet_streaming(
     total_samples = 0
     carry = np.empty(0, dtype=np.float32)
     first_chunk = True
+    emitted_frames = 0
     scream_scores_chunks: List[np.ndarray] = []
     moan_scores_chunks: List[np.ndarray] = []
+    debug_windows: List[dict] = []
 
     for chunk in iter_audio_chunks(
         video_path,
@@ -1704,22 +1725,33 @@ def analyze_yamnet_streaming(
         frame_scores = scores.numpy()
         start_row = 0 if first_chunk else min(duplicate_frames, frame_scores.shape[0])
         if start_row < frame_scores.shape[0]:
-            scream_scores_chunks.append(
-                _yamnet_weighted_score(
-                    frame_scores[start_row:],
-                    class_index,
-                    YAMNET_SCREAM_WEIGHTS,
-                    YAMNET_NEGATIVE_WEIGHTS,
-                )
+            chunk_frame_scores = frame_scores[start_row:]
+            scream_chunk_scores = _yamnet_weighted_score(
+                chunk_frame_scores,
+                class_index,
+                YAMNET_SCREAM_WEIGHTS,
+                YAMNET_NEGATIVE_WEIGHTS,
             )
-            moan_scores_chunks.append(
-                _yamnet_weighted_score(
-                    frame_scores[start_row:],
-                    class_index,
-                    YAMNET_MOAN_WEIGHTS,
-                    YAMNET_NEGATIVE_WEIGHTS,
-                )
+            moan_chunk_scores = _yamnet_weighted_score(
+                chunk_frame_scores,
+                class_index,
+                YAMNET_MOAN_WEIGHTS,
+                YAMNET_NEGATIVE_WEIGHTS,
             )
+            scream_scores_chunks.append(scream_chunk_scores)
+            moan_scores_chunks.append(moan_chunk_scores)
+            if collect_debug:
+                for local_idx, row_scores in enumerate(chunk_frame_scores):
+                    frame_idx = emitted_frames + local_idx
+                    win_start = start_sec + frame_idx * frame_hop_sec
+                    debug_windows.append({
+                        "start": round(win_start, 3),
+                        "end": round(win_start + frame_span_sec, 3),
+                        "scream_score": round(float(scream_chunk_scores[local_idx]), 4),
+                        "moan_score": round(float(moan_chunk_scores[local_idx]), 4),
+                        "top_labels": _yamnet_top_labels(row_scores, class_names, top_k),
+                    })
+                emitted_frames += chunk_frame_scores.shape[0]
 
         if overlap_samples > 0 and work.size > overlap_samples:
             carry = work[-overlap_samples:].copy()
@@ -1758,6 +1790,12 @@ def analyze_yamnet_streaming(
         "male_pct": moan_pct,
         "segments": scream_segments + moan_segments,
         "detector": "yamnet",
+        "yamnet_debug": {
+            "frame_hop_sec": frame_hop_sec,
+            "frame_span_sec": frame_span_sec,
+            "score_threshold": score_threshold,
+            "windows": debug_windows,
+        } if collect_debug else None,
     }
 
 
@@ -1777,6 +1815,8 @@ def analyze_media_file(
     duration_sec: Optional[float] = None,
     yamnet_model: str = "https://tfhub.dev/google/yamnet/1",
     yamnet_score_threshold: float = 0.35,
+    yamnet_collect_debug: bool = False,
+    yamnet_top_k: int = 8,
 ) -> Dict[str, object]:
     """Detector abstraction point for current heuristic and future model-based detectors."""
     if detector == "heuristic":
@@ -1801,6 +1841,8 @@ def analyze_media_file(
             score_threshold=yamnet_score_threshold,
             start_sec=start_sec,
             duration_sec=duration_sec,
+            collect_debug=yamnet_collect_debug,
+            top_k=yamnet_top_k,
         )
     raise ValueError(f"Unsupported detector: {detector}")
 
@@ -1821,6 +1863,26 @@ def export_segments_json(results: List[dict], output_path: Path) -> None:
                 "segments": r.get("segments", []),
             }
             for r in results
+        ],
+    }
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def export_yamnet_debug_json(results: List[dict], output_path: Path) -> None:
+    payload = {
+        "version": 1,
+        "files": [
+            {
+                "path": r["path"],
+                "name": r["name"],
+                "kind": r["kind"],
+                "duration": round(float(r["duration"] or 0.0), 3),
+                "detector": r.get("detector", "heuristic"),
+                "metric_labels": list(detector_metric_labels(str(r.get("detector", "heuristic")))),
+                "yamnet_debug": r.get("yamnet_debug"),
+            }
+            for r in results
+            if r.get("detector") == "yamnet" and r.get("yamnet_debug")
         ],
     }
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -1894,6 +1956,8 @@ def _analyze_worker(video_path_str: str, params: Dict[str, object]) -> Dict[str,
     detector        = str(params["detector"])        # type: ignore[arg-type]
     yamnet_model    = str(params["yamnet_model"])    # type: ignore[arg-type]
     yamnet_score_threshold = float(params["yamnet_score_threshold"])  # type: ignore[arg-type]
+    yamnet_collect_debug = bool(params["yamnet_collect_debug"])  # type: ignore[arg-type]
+    yamnet_top_k = int(params["yamnet_top_k"])  # type: ignore[arg-type]
 
     # When a clip duration is requested, seek to the end of the file.
     # We need the full duration from ffprobe to compute the start offset.
@@ -1925,6 +1989,8 @@ def _analyze_worker(video_path_str: str, params: Dict[str, object]) -> Dict[str,
             duration_sec=extract_dur,
             yamnet_model=yamnet_model,
             yamnet_score_threshold=yamnet_score_threshold,
+            yamnet_collect_debug=yamnet_collect_debug,
+            yamnet_top_k=yamnet_top_k,
         )
     except Exception:
         if detector != "heuristic":
@@ -1937,6 +2003,7 @@ def _analyze_worker(video_path_str: str, params: Dict[str, object]) -> Dict[str,
             "male_pct": -1.0,
             "segments": [],
             "detector": detector,
+            "yamnet_debug": None,
         }
 
     # Use ffprobe-reported full duration when clipping; otherwise derive from analyzed audio.
@@ -1957,6 +2024,7 @@ def _make_result(video_path: Path, data: Dict[str, object], cached: bool) -> dic
         "male_pct":   data.get("male_pct",   -1.0),
         "segments":   data.get("segments", []),
         "detector":   data.get("detector", "heuristic"),
+        "yamnet_debug": data.get("yamnet_debug"),
         "cached":     cached,
     }
 
@@ -2023,7 +2091,14 @@ def load_config(config_path: Path) -> Dict[str, object]:
         return {}
 
     defaults: Dict[str, object] = {}
-    str_keys   = ("output", "cache", "segments_json", "detector", "yamnet_model")
+    str_keys   = (
+        "output",
+        "cache",
+        "segments_json",
+        "detector",
+        "yamnet_model",
+        "yamnet_label_debug_json",
+    )
     float_keys = (
         "threshold",
         "clip_duration",
@@ -2032,7 +2107,7 @@ def load_config(config_path: Path) -> Dict[str, object]:
         "noise_floor_pct",
         "yamnet_score_threshold",
     )
-    int_keys   = ("sample_rate", "jobs", "n_fft", "hop_length")
+    int_keys   = ("sample_rate", "jobs", "n_fft", "hop_length", "yamnet_top_k")
     bool_keys  = ("no_cache", "force")
 
     for k in str_keys:
@@ -2120,6 +2195,14 @@ def main() -> None:
     parser.add_argument(
         "--yamnet-score-threshold", type=float, default=0.35, metavar="N",
         help="Segment activation threshold for YAMNet weighted scream/moan scores",
+    )
+    parser.add_argument(
+        "--yamnet-label-debug-json", default="", metavar="FILE",
+        help="Optional JSON export with per-window YAMNet scores and top AudioSet labels",
+    )
+    parser.add_argument(
+        "--yamnet-top-k", type=int, default=8, metavar="N",
+        help="How many top AudioSet labels to include per window in --yamnet-label-debug-json",
     )
     parser.add_argument(
         "-t", "--threshold", type=float, default=3.0, metavar="N",
@@ -2248,6 +2331,8 @@ def main() -> None:
         "detector":           args.detector,
         "yamnet_model":       args.yamnet_model,
         "yamnet_score_threshold": args.yamnet_score_threshold,
+        "yamnet_collect_debug": bool(args.yamnet_label_debug_json),
+        "yamnet_top_k":       args.yamnet_top_k,
     }
 
     # Pre-check cache in the main process; only submit uncached files to workers.
@@ -2298,6 +2383,7 @@ def main() -> None:
                         "male_pct": -1.0,
                         "segments": [],
                         "detector": args.detector,
+                        "yamnet_debug": None,
                     }
                 results[i] = _make_result(vp, data, cached=False)
                 key = _cache_key(vp, params)
@@ -2324,6 +2410,7 @@ def main() -> None:
                             "male_pct": -1.0,
                             "segments": [],
                             "detector": args.detector,
+                            "yamnet_debug": None,
                         }
                     results[i] = _make_result(vp, data, cached=False)
                     key = _cache_key(vp, params)
@@ -2344,6 +2431,10 @@ def main() -> None:
         segments_path = Path(args.segments_json)
         export_segments_json(results, segments_path)
         print(f"Segments JSON:    {segments_path.resolve()}", file=sys.stderr)
+    if args.yamnet_label_debug_json:
+        debug_path = Path(args.yamnet_label_debug_json)
+        export_yamnet_debug_json(results, debug_path)
+        print(f"YAMNet debug:     {debug_path.resolve()}", file=sys.stderr)
 
 
 if __name__ == "__main__":
