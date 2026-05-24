@@ -11,6 +11,7 @@ Each file gets a **Female %** (fraction of time with detectable female-range voc
 - **Python 3.11+** (or Python 3.8+ with `tomli` installed for config file support)
 - **ffmpeg** and **ffprobe** in your PATH
 - Python packages: `numpy`, `scipy`
+- Optional for `--detector yamnet`: `tensorflow`, `tensorflow-hub`
 
 ---
 
@@ -44,6 +45,12 @@ If you prefer a global install and your Python allows it:
 
 ```bash
 pip install numpy scipy
+```
+
+For the YAMNet detector path:
+
+```bash
+pip install -r requirements-yamnet.txt
 ```
 
 If you are on Python 3.8–3.10 and want config file support, also install:
@@ -136,6 +143,8 @@ python3 screamfinder.py [options] PATH [PATH ...]
 | Flag | Default | Description |
 |---|---|---|
 | `--detector NAME` | `heuristic` | Detection backend. `heuristic` is the current streaming STFT detector and is the integration point future model-based detectors will share. |
+| `--yamnet-model HANDLE` | `https://tfhub.dev/google/yamnet/1` | TensorFlow Hub handle or local SavedModel path used when `--detector yamnet` is selected |
+| `--yamnet-score-threshold N` | `0.35` | Threshold for YAMNet scream/moan segment activation |
 | `-t N`, `--threshold N` | `4.0` | A frame is counted as vocal when its band energy exceeds this multiple of the per-band noise floor. Raise to reduce false positives; lower to catch quieter vocalizations. |
 | `--female-freq LOW HIGH` | `500 2000` | Female vocalization frequency range (Hz) |
 | `--male-freq LOW HIGH` | `80 200` | Male vocalization frequency range (Hz) |
@@ -189,6 +198,8 @@ jobs  = 4
 cache = ".screamfinder-cache.json"
 detector = "heuristic"
 segments_json = ""
+yamnet_model = "https://tfhub.dev/google/yamnet/1"
+yamnet_score_threshold = 0.35
 
 min_audio_rms   = 0.005
 noise_floor_pct = 10.0
@@ -218,6 +229,10 @@ Directories are searched recursively. Any format ffmpeg can decode will work for
 5. **Detection** — a frame is counted as "vocal" when its band energy exceeds `threshold × noise_floor`.
 6. **Sustained filter** — isolated bursts shorter than `--min-vocal-duration` seconds are discarded.
 7. **Result** — `female_pct` and `male_pct` are the percentage of frames that passed all filters.
+
+### YAMNet detector
+
+When `--detector yamnet` is selected, ScreamFinder decodes audio at `16000 Hz` and runs Google's YAMNet AudioSet classifier over streaming chunks. The report columns are relabeled to `Scream %` and `Moan %`, and the JSON export labels segments as `scream` or `moan`.
 
 ### Segment JSON
 

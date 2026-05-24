@@ -49,6 +49,10 @@ detector = "heuristic"
 # Leave empty to disable.
 segments_json = ""
 
+# YAMNet configuration (used only when detector = "yamnet")
+yamnet_model = "https://tfhub.dev/google/yamnet/1"
+yamnet_score_threshold = 0.35
+
 # Set to true to disable caching entirely
 no_cache = false
 

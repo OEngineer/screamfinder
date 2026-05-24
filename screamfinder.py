@@ -19,6 +19,7 @@ Examples:
 """
 
 import argparse
+import csv
 import json
 import os
 import shutil
@@ -56,12 +57,62 @@ AUDIO_EXTENSIONS = frozenset({
 
 MEDIA_EXTENSIONS = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
 STREAM_CHUNK_SECONDS = 120.0
-DETECTOR_CHOICES = ("heuristic",)
+DETECTOR_CHOICES = ("heuristic", "yamnet")
+YAMNET_SAMPLE_RATE = 16000
+YAMNET_PATCH_WINDOW_SECONDS = 0.96
+YAMNET_PATCH_HOP_SECONDS = 0.48
+YAMNET_CHUNK_SECONDS = 30.0
+YAMNET_CHUNK_OVERLAP_SECONDS = 1.0
+YAMNET_SCREAM_WEIGHTS = {
+    "Screaming": 1.00,
+    "Yell": 0.75,
+    "Shout": 0.70,
+    "Whoop": 0.25,
+}
+YAMNET_MOAN_WEIGHTS = {
+    "Wail, moan": 1.00,
+    "Groan": 0.90,
+    "Crying, sobbing": 0.55,
+    "Gasp": 0.45,
+    "Pant": 0.35,
+    "Whimper": 0.35,
+}
+YAMNET_NEGATIVE_WEIGHTS = {
+    "Speech": 0.35,
+    "Conversation": 0.40,
+    "Narration, monologue": 0.40,
+    "Music": 0.70,
+    "Background music": 0.80,
+}
 
 
 def media_kind(path: Path) -> str:
     """Return "audio" if path's suffix is a known audio extension, else "video"."""
     return "audio" if path.suffix.lower() in AUDIO_EXTENSIONS else "video"
+
+
+def detector_metric_labels(detector: str) -> Tuple[str, str]:
+    if detector == "yamnet":
+        return "Scream %", "Moan %"
+    return "Female %", "Male %"
+
+
+def build_report_subtitle(file_count: int, args: argparse.Namespace) -> str:
+    clip_info = f" &bull; Clip: last {args.clip_duration:g}s" if args.clip_duration > 0 else ""
+    if args.detector == "yamnet":
+        return (
+            f"{file_count} file(s) &bull; Detector: YAMNet &bull; "
+            f"Sample rate: {YAMNET_SAMPLE_RATE} Hz &bull; "
+            f"Threshold: {args.yamnet_score_threshold:.2f}{clip_info}"
+        )
+    return (
+        f"{file_count} file(s) &bull; "
+        f"Female: {args.female_freq[0]}–{args.female_freq[1]} Hz &bull; "
+        f"Male: {args.male_freq[0]}–{args.male_freq[1]} Hz &bull; "
+        f"Threshold: {args.threshold}× &bull; "
+        f"Noise floor: {args.noise_floor_pct}th pct &bull; "
+        f"Min sustained: {args.min_vocal_duration}s{clip_info}"
+    )
 
 # ---------------------------------------------------------------------------
 # Embedded CSS
@@ -946,12 +997,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 <h1><span>Scream</span>Finder</h1>
 <p class="subtitle">
-  <<<FILE_COUNT>>> file(s) &bull;
-  Female: <<<FFREQ_LO>>>–<<<FFREQ_HI>>> Hz &bull;
-  Male: <<<MFREQ_LO>>>–<<<MFREQ_HI>>> Hz &bull;
-  Threshold: <<<THRESHOLD>>>× &bull;
-  Noise floor: <<<NOISE_FLOOR_PCT>>>th pct &bull;
-  Min sustained: <<<MIN_VOC_DUR>>>s<<<CLIP_INFO>>>
+  <<<SUBTITLE>>>
 </p>
 
 <div class="controls">
@@ -963,12 +1009,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <span class="slider-val" id="w-dur-val">1.0</span>
     </div>
     <div class="slider-group">
-      <label><span class="swatch" style="background:#e91e8c"></span>Female %</label>
+      <label><span class="swatch" style="background:#e91e8c"></span><<<METRIC1_LABEL>>></label>
       <input type="range" id="w-fem" min="0" max="5" step="0.1" value="2.0">
       <span class="slider-val" id="w-fem-val">2.0</span>
     </div>
     <div class="slider-group">
-      <label><span class="swatch" style="background:#2196f3"></span>Male %</label>
+      <label><span class="swatch" style="background:#2196f3"></span><<<METRIC2_LABEL>>></label>
       <input type="range" id="w-mal" min="0" max="5" step="0.1" value="1.0">
       <span class="slider-val" id="w-mal-val">1.0</span>
     </div>
@@ -982,8 +1028,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <th style="width:36px">#</th>
         <th data-col="name">Filename</th>
         <th data-col="duration">Duration</th>
-        <th data-col="female_pct">Female %</th>
-        <th data-col="male_pct">Male %</th>
+        <th data-col="female_pct"><<<METRIC1_LABEL>>></th>
+        <th data-col="male_pct"><<<METRIC2_LABEL>>></th>
         <th data-col="score">Score</th>
       </tr>
     </thead>
@@ -1510,6 +1556,211 @@ def analyze_vocalizations_streaming(
     }
 
 
+_YAMNET_RESOURCES: Dict[str, object] = {}
+
+
+def _load_yamnet_resources(model_handle: str) -> Dict[str, object]:
+    cached = _YAMNET_RESOURCES.get(model_handle)
+    if isinstance(cached, dict):
+        return cached
+
+    try:
+        import tensorflow as tf  # type: ignore[import-not-found]
+        import tensorflow_hub as hub  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise RuntimeError(
+            "YAMNet detector requires 'tensorflow' and 'tensorflow-hub'. "
+            "Install them before using --detector yamnet."
+        ) from exc
+
+    try:
+        model = hub.load(model_handle)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not load YAMNet model from {model_handle!r}. "
+            "Pass a local SavedModel path with --yamnet-model or make sure the model "
+            "handle is reachable."
+        ) from exc
+
+    class_map_value = model.class_map_path().numpy()
+    class_map_path = class_map_value.decode("utf-8") if isinstance(class_map_value, bytes) else str(class_map_value)
+    class_names: List[str] = []
+    with open(class_map_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            class_names.append(row["display_name"])
+
+    resources = {
+        "tf": tf,
+        "model": model,
+        "class_names": class_names,
+        "class_index": {name: idx for idx, name in enumerate(class_names)},
+    }
+    _YAMNET_RESOURCES[model_handle] = resources
+    return resources
+
+
+def _yamnet_weighted_score(
+    frame_scores: np.ndarray,
+    class_index: Dict[str, int],
+    positive_weights: Dict[str, float],
+    negative_weights: Dict[str, float],
+) -> np.ndarray:
+    if frame_scores.size == 0:
+        return np.empty(0, dtype=np.float32)
+
+    pos = np.zeros(frame_scores.shape[0], dtype=np.float32)
+    neg = np.zeros(frame_scores.shape[0], dtype=np.float32)
+    for label, weight in positive_weights.items():
+        idx = class_index.get(label)
+        if idx is not None:
+            pos += frame_scores[:, idx].astype(np.float32) * weight
+    for label, weight in negative_weights.items():
+        idx = class_index.get(label)
+        if idx is not None:
+            neg += frame_scores[:, idx].astype(np.float32) * weight
+    return np.clip(pos - neg, 0.0, 1.0)
+
+
+def _segments_from_scores(
+    scores: np.ndarray,
+    label: str,
+    threshold: float,
+    frame_hop_sec: float,
+    frame_span_sec: float,
+    start_offset_sec: float,
+) -> Tuple[float, List[dict]]:
+    if scores.size == 0:
+        return 0.0, []
+    active = scores >= threshold
+    if not np.any(active):
+        return 0.0, []
+
+    labeled, n = nd_label(active)
+    segments: List[dict] = []
+    analyzed_end = start_offset_sec + ((len(scores) - 1) * frame_hop_sec + frame_span_sec)
+    for idx in range(1, n + 1):
+        pos = np.flatnonzero(labeled == idx)
+        if pos.size == 0:
+            continue
+        start_frame = int(pos[0])
+        end_frame = int(pos[-1])
+        start = start_offset_sec + start_frame * frame_hop_sec
+        end = min(analyzed_end, start_offset_sec + end_frame * frame_hop_sec + frame_span_sec)
+        seg_scores = scores[pos]
+        segments.append({
+            "label": label,
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "duration": round(max(0.0, end - start), 3),
+            "frame_count": int(pos.size),
+            "peak_score": round(float(np.max(seg_scores)), 4),
+            "avg_score": round(float(np.mean(seg_scores)), 4),
+        })
+    return 100.0 * float(np.mean(active)), segments
+
+
+def analyze_yamnet_streaming(
+    video_path: Path,
+    model_handle: str,
+    score_threshold: float,
+    start_sec: float = 0.0,
+    duration_sec: Optional[float] = None,
+) -> Dict[str, object]:
+    """Run YAMNet on streaming audio chunks and emit scream/moan segments."""
+    resources = _load_yamnet_resources(model_handle)
+    tf = resources["tf"]  # type: ignore[assignment]
+    model = resources["model"]
+    class_index = resources["class_index"]  # type: ignore[assignment]
+
+    frame_hop_sec = YAMNET_PATCH_HOP_SECONDS
+    frame_span_sec = YAMNET_PATCH_WINDOW_SECONDS
+    overlap_samples = int(round(YAMNET_CHUNK_OVERLAP_SECONDS * YAMNET_SAMPLE_RATE))
+    duplicate_frames = int(np.floor(YAMNET_CHUNK_OVERLAP_SECONDS / frame_hop_sec))
+
+    total_samples = 0
+    carry = np.empty(0, dtype=np.float32)
+    first_chunk = True
+    scream_scores_chunks: List[np.ndarray] = []
+    moan_scores_chunks: List[np.ndarray] = []
+
+    for chunk in iter_audio_chunks(
+        video_path,
+        YAMNET_SAMPLE_RATE,
+        start_sec=start_sec,
+        duration_sec=duration_sec,
+        chunk_seconds=YAMNET_CHUNK_SECONDS,
+    ):
+        if chunk.size == 0:
+            continue
+        total_samples += int(chunk.size)
+        work = np.concatenate((carry, chunk)) if carry.size else chunk
+        if work.size < int(round(frame_span_sec * YAMNET_SAMPLE_RATE)):
+            carry = work
+            first_chunk = False
+            continue
+
+        waveform = tf.convert_to_tensor(work, dtype=tf.float32)
+        scores, _embeddings, _spectrogram = model(waveform)
+        frame_scores = scores.numpy()
+        start_row = 0 if first_chunk else min(duplicate_frames, frame_scores.shape[0])
+        if start_row < frame_scores.shape[0]:
+            scream_scores_chunks.append(
+                _yamnet_weighted_score(
+                    frame_scores[start_row:],
+                    class_index,
+                    YAMNET_SCREAM_WEIGHTS,
+                    YAMNET_NEGATIVE_WEIGHTS,
+                )
+            )
+            moan_scores_chunks.append(
+                _yamnet_weighted_score(
+                    frame_scores[start_row:],
+                    class_index,
+                    YAMNET_MOAN_WEIGHTS,
+                    YAMNET_NEGATIVE_WEIGHTS,
+                )
+            )
+
+        if overlap_samples > 0 and work.size > overlap_samples:
+            carry = work[-overlap_samples:].copy()
+        else:
+            carry = work.copy()
+        first_chunk = False
+
+    analyzed_duration = total_samples / YAMNET_SAMPLE_RATE if total_samples > 0 else 0.0
+    scream_scores = (
+        np.concatenate(scream_scores_chunks) if scream_scores_chunks else np.empty(0, dtype=np.float32)
+    )
+    moan_scores = (
+        np.concatenate(moan_scores_chunks) if moan_scores_chunks else np.empty(0, dtype=np.float32)
+    )
+
+    scream_pct, scream_segments = _segments_from_scores(
+        scream_scores,
+        "scream",
+        score_threshold,
+        frame_hop_sec,
+        frame_span_sec,
+        start_sec,
+    )
+    moan_pct, moan_segments = _segments_from_scores(
+        moan_scores,
+        "moan",
+        score_threshold,
+        frame_hop_sec,
+        frame_span_sec,
+        start_sec,
+    )
+
+    return {
+        "duration": analyzed_duration,
+        "female_pct": scream_pct,
+        "male_pct": moan_pct,
+        "segments": scream_segments + moan_segments,
+        "detector": "yamnet",
+    }
+
+
 def analyze_media_file(
     video_path: Path,
     detector: str,
@@ -1524,6 +1775,8 @@ def analyze_media_file(
     noise_floor_pct: float,
     start_sec: float = 0.0,
     duration_sec: Optional[float] = None,
+    yamnet_model: str = "https://tfhub.dev/google/yamnet/1",
+    yamnet_score_threshold: float = 0.35,
 ) -> Dict[str, object]:
     """Detector abstraction point for current heuristic and future model-based detectors."""
     if detector == "heuristic":
@@ -1538,6 +1791,14 @@ def analyze_media_file(
             min_vocal_duration,
             min_audio_rms,
             noise_floor_pct,
+            start_sec=start_sec,
+            duration_sec=duration_sec,
+        )
+    if detector == "yamnet":
+        return analyze_yamnet_streaming(
+            video_path,
+            model_handle=yamnet_model,
+            score_threshold=yamnet_score_threshold,
             start_sec=start_sec,
             duration_sec=duration_sec,
         )
@@ -1556,6 +1817,7 @@ def export_segments_json(results: List[dict], output_path: Path) -> None:
                 "female_pct": round(float(max(r.get("female_pct", -1.0), 0.0)), 3),
                 "male_pct": round(float(max(r.get("male_pct", -1.0), 0.0)), 3),
                 "detector": r.get("detector", "heuristic"),
+                "metric_labels": list(detector_metric_labels(str(r.get("detector", "heuristic")))),
                 "segments": r.get("segments", []),
             }
             for r in results
@@ -1619,7 +1881,7 @@ def _analyze_worker(video_path_str: str, params: Dict[str, object]) -> Dict[str,
     Returns a dict with keys: duration, female_pct, male_pct.
     """
     video_path      = Path(video_path_str)
-    sample_rate     = int(params["sample_rate"])      # type: ignore[arg-type]
+    sample_rate     = int(params["analysis_sample_rate"])  # type: ignore[arg-type]
     n_fft           = int(params["n_fft"])            # type: ignore[arg-type]
     hop_length      = int(params["hop_length"])       # type: ignore[arg-type]
     female_freq     = tuple(params["female_freq"])    # type: ignore[arg-type]
@@ -1630,6 +1892,8 @@ def _analyze_worker(video_path_str: str, params: Dict[str, object]) -> Dict[str,
     noise_floor_pct = float(params["noise_floor_pct"])  # type: ignore[arg-type]
     clip_duration   = float(params["clip_duration"]) # type: ignore[arg-type]
     detector        = str(params["detector"])        # type: ignore[arg-type]
+    yamnet_model    = str(params["yamnet_model"])    # type: ignore[arg-type]
+    yamnet_score_threshold = float(params["yamnet_score_threshold"])  # type: ignore[arg-type]
 
     # When a clip duration is requested, seek to the end of the file.
     # We need the full duration from ffprobe to compute the start offset.
@@ -1659,8 +1923,12 @@ def _analyze_worker(video_path_str: str, params: Dict[str, object]) -> Dict[str,
             noise_floor_pct,
             start_sec=start_sec,
             duration_sec=extract_dur,
+            yamnet_model=yamnet_model,
+            yamnet_score_threshold=yamnet_score_threshold,
         )
     except Exception:
+        if detector != "heuristic":
+            raise
         # Audio extraction failed; fall back to ffprobe for duration.
         duration = reported_duration or get_media_duration(video_path) or 0.0
         return {
@@ -1699,6 +1967,7 @@ def _make_result(video_path: Path, data: Dict[str, object], cached: bool) -> dic
 
 def generate_html(results: List[dict], args: argparse.Namespace) -> str:
     max_duration = max((r["duration"] or 0 for r in results), default=1.0) or 1.0
+    metric1_label, metric2_label = detector_metric_labels(args.detector)
 
     js_data = []
     for r in results:
@@ -1721,17 +1990,9 @@ def generate_html(results: List[dict], args: argparse.Namespace) -> str:
         .replace("<<<JS>>>",        JS)
         .replace("<<<DATA_JSON>>>", data_json)
         .replace("<<<FILE_COUNT>>>", str(len(results)))
-        .replace("<<<FFREQ_LO>>>",  str(args.female_freq[0]))
-        .replace("<<<FFREQ_HI>>>",  str(args.female_freq[1]))
-        .replace("<<<MFREQ_LO>>>",  str(args.male_freq[0]))
-        .replace("<<<MFREQ_HI>>>",  str(args.male_freq[1]))
-        .replace("<<<THRESHOLD>>>",       str(args.threshold))
-        .replace("<<<NOISE_FLOOR_PCT>>>", str(args.noise_floor_pct))
-        .replace("<<<MIN_VOC_DUR>>>",     str(args.min_vocal_duration))
-        .replace("<<<CLIP_INFO>>>", (
-            f" &bull; Clip: last {args.clip_duration:g}s"
-            if args.clip_duration > 0 else ""
-        ))
+        .replace("<<<SUBTITLE>>>", build_report_subtitle(len(results), args))
+        .replace("<<<METRIC1_LABEL>>>", metric1_label)
+        .replace("<<<METRIC2_LABEL>>>", metric2_label)
     )
     return html
 
@@ -1762,8 +2023,15 @@ def load_config(config_path: Path) -> Dict[str, object]:
         return {}
 
     defaults: Dict[str, object] = {}
-    str_keys   = ("output", "cache", "segments_json", "detector")
-    float_keys = ("threshold", "clip_duration", "min_vocal_duration", "min_audio_rms", "noise_floor_pct")
+    str_keys   = ("output", "cache", "segments_json", "detector", "yamnet_model")
+    float_keys = (
+        "threshold",
+        "clip_duration",
+        "min_vocal_duration",
+        "min_audio_rms",
+        "noise_floor_pct",
+        "yamnet_score_threshold",
+    )
     int_keys   = ("sample_rate", "jobs", "n_fft", "hop_length")
     bool_keys  = ("no_cache", "force")
 
@@ -1846,6 +2114,14 @@ def main() -> None:
         help="Detection backend to use. 'heuristic' is the current streaming STFT detector.",
     )
     parser.add_argument(
+        "--yamnet-model", default="https://tfhub.dev/google/yamnet/1", metavar="HANDLE",
+        help="TensorFlow Hub handle or local SavedModel path for YAMNet when --detector yamnet is used",
+    )
+    parser.add_argument(
+        "--yamnet-score-threshold", type=float, default=0.35, metavar="N",
+        help="Segment activation threshold for YAMNet weighted scream/moan scores",
+    )
+    parser.add_argument(
         "-t", "--threshold", type=float, default=3.0, metavar="N",
         help="Threshold multiplier above whole-file average energy (higher = fewer detections)",
     )
@@ -1922,12 +2198,19 @@ def main() -> None:
     args.female_freq = tuple(args.female_freq)  # type: ignore[assignment]
     args.male_freq   = tuple(args.male_freq)     # type: ignore[assignment]
 
-    nyquist = args.sample_rate / 2.0
-    if args.female_freq[1] > nyquist:
+    analysis_sample_rate = YAMNET_SAMPLE_RATE if args.detector == "yamnet" else args.sample_rate
+    nyquist = analysis_sample_rate / 2.0
+    if args.detector == "heuristic" and args.female_freq[1] > nyquist:
         print(
             f"WARNING: female-freq high ({args.female_freq[1]} Hz) exceeds "
-            f"Nyquist ({nyquist} Hz) for sample-rate {args.sample_rate}. "
+            f"Nyquist ({nyquist} Hz) for sample-rate {analysis_sample_rate}. "
             f"Consider raising --sample-rate.",
+            file=sys.stderr,
+        )
+    if args.detector == "yamnet" and args.sample_rate != YAMNET_SAMPLE_RATE:
+        print(
+            f"INFO: detector 'yamnet' always decodes audio at {YAMNET_SAMPLE_RATE} Hz; "
+            f"ignoring --sample-rate {args.sample_rate}.",
             file=sys.stderr,
         )
 
@@ -1952,6 +2235,7 @@ def main() -> None:
     # Build analysis params dict (also used as the cache key component)
     params: Dict[str, object] = {
         "sample_rate":        args.sample_rate,
+        "analysis_sample_rate": analysis_sample_rate,
         "n_fft":              args.n_fft,
         "hop_length":         args.hop_length,
         "female_freq":        list(args.female_freq),
@@ -1962,6 +2246,8 @@ def main() -> None:
         "min_audio_rms":      args.min_audio_rms,
         "noise_floor_pct":    args.noise_floor_pct,
         "detector":           args.detector,
+        "yamnet_model":       args.yamnet_model,
+        "yamnet_score_threshold": args.yamnet_score_threshold,
     }
 
     # Pre-check cache in the main process; only submit uncached files to workers.
@@ -1973,6 +2259,9 @@ def main() -> None:
     def _print_progress(name: str, data: Dict[str, object], cached: bool) -> None:
         nonlocal completed
         completed += 1
+        metric1_label, metric2_label = detector_metric_labels(str(data.get("detector", args.detector)))
+        metric1_name = metric1_label.replace(" %", "").lower()
+        metric2_name = metric2_label.replace(" %", "").lower()
         tag     = " (cached)" if cached else ""
         dur_str = format_duration(data.get("duration"))  # type: ignore[arg-type]
         fem     = data.get("female_pct", -1.0)
@@ -1981,7 +2270,7 @@ def main() -> None:
         mal_str = f"{mal:.1f}%" if float(mal) >= 0 else "ERROR"  # type: ignore[arg-type]
         print(
             f"[{completed}/{n_total}] {name}{tag}: "
-            f"dur={dur_str}  female={fem_str}  male={mal_str}",
+            f"dur={dur_str}  {metric1_name}={fem_str}  {metric2_name}={mal_str}",
             file=sys.stderr,
         )
 
