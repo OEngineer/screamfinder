@@ -56,6 +56,7 @@ AUDIO_EXTENSIONS = frozenset({
 
 MEDIA_EXTENSIONS = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
 STREAM_CHUNK_SECONDS = 120.0
+DETECTOR_CHOICES = ("heuristic",)
 
 
 def media_kind(path: Path) -> str:
@@ -1207,6 +1208,83 @@ def _filter_short_runs(vocal: np.ndarray, min_frames: int) -> np.ndarray:
     return keep[labeled]
 
 
+def _segments_from_mask(
+    vocal: np.ndarray,
+    frame_hop_sec: float,
+    frame_span_sec: float,
+    start_offset_sec: float,
+    band_energy: np.ndarray,
+    noise_floor: float,
+    label: str,
+    freq_range: Tuple[float, float],
+) -> List[dict]:
+    """Convert a boolean frame mask into timestamped segment metadata."""
+    if vocal.size == 0 or not np.any(vocal):
+        return []
+
+    labeled, n = nd_label(vocal)
+    if n == 0:
+        return []
+
+    segments: List[dict] = []
+    analyzed_end = start_offset_sec + ((len(vocal) - 1) * frame_hop_sec + frame_span_sec)
+    for idx in range(1, n + 1):
+        pos = np.flatnonzero(labeled == idx)
+        if pos.size == 0:
+            continue
+        start_frame = int(pos[0])
+        end_frame = int(pos[-1])
+        start = start_offset_sec + start_frame * frame_hop_sec
+        end = min(analyzed_end, start_offset_sec + end_frame * frame_hop_sec + frame_span_sec)
+        seg_energy = band_energy[pos]
+        ratios = seg_energy / noise_floor if noise_floor > 0 else np.zeros_like(seg_energy)
+        segments.append({
+            "label": label,
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "duration": round(max(0.0, end - start), 3),
+            "frame_count": int(pos.size),
+            "peak_ratio": round(float(np.max(ratios)), 4) if ratios.size else 0.0,
+            "avg_ratio": round(float(np.mean(ratios)), 4) if ratios.size else 0.0,
+            "freq_low": float(freq_range[0]),
+            "freq_high": float(freq_range[1]),
+        })
+    return segments
+
+
+def _detect_band_activity(
+    band_energy: np.ndarray,
+    threshold: float,
+    min_frames: int,
+    noise_floor_pct: float,
+    frame_hop_sec: float,
+    frame_span_sec: float,
+    start_offset_sec: float,
+    label: str,
+    freq_range: Tuple[float, float],
+) -> Dict[str, object]:
+    if band_energy.size == 0:
+        return {"pct": 0.0, "segments": []}
+    noise_floor = float(np.percentile(band_energy, noise_floor_pct))
+    if noise_floor <= 0:
+        return {"pct": 0.0, "segments": []}
+    vocal = band_energy > threshold * noise_floor
+    vocal = _filter_short_runs(vocal, min_frames)
+    return {
+        "pct": 100.0 * float(np.mean(vocal)),
+        "segments": _segments_from_mask(
+            vocal,
+            frame_hop_sec,
+            frame_span_sec,
+            start_offset_sec,
+            band_energy,
+            noise_floor,
+            label,
+            freq_range,
+        ),
+    }
+
+
 def analyze_vocalizations(
     audio: np.ndarray,
     sample_rate: int,
@@ -1298,8 +1376,8 @@ def analyze_vocalizations_streaming(
     noise_floor_pct: float = 10.0,
     start_sec: float = 0.0,
     duration_sec: Optional[float] = None,
-) -> Tuple[float, float, float]:
-    """Stream audio from ffmpeg and compute the same metrics without full-file buffers."""
+) -> Dict[str, object]:
+    """Stream audio from ffmpeg and compute heuristic metrics without full-file buffers."""
     if n_fft <= 0 or hop_length <= 0 or hop_length > n_fft:
         raise ValueError("n_fft and hop_length must be positive, and hop_length <= n_fft")
 
@@ -1370,13 +1448,27 @@ def analyze_vocalizations_streaming(
 
     analyzed_duration = total_samples / sample_rate if total_samples > 0 else 0.0
     if total_samples < n_fft:
-        return 0.0, 0.0, analyzed_duration
+        return {
+            "duration": analyzed_duration,
+            "female_pct": 0.0,
+            "male_pct": 0.0,
+            "segments": [],
+            "detector": "heuristic",
+        }
 
     audio_rms = float(np.sqrt(sum_squares / total_samples)) if total_samples > 0 else 0.0
     if audio_rms < min_audio_rms:
-        return 0.0, 0.0, analyzed_duration
+        return {
+            "duration": analyzed_duration,
+            "female_pct": 0.0,
+            "male_pct": 0.0,
+            "segments": [],
+            "detector": "heuristic",
+        }
 
     frames_per_sec = sample_rate / hop_length
+    frame_hop_sec = hop_length / sample_rate
+    frame_span_sec = n_fft / sample_rate
     min_frames = max(1, int(round(min_vocal_duration * frames_per_sec)))
 
     female_energy = (
@@ -1386,17 +1478,90 @@ def analyze_vocalizations_streaming(
         np.concatenate(male_energy_chunks) if male_energy_chunks else np.empty(0, dtype=np.float32)
     )
 
-    def detect(band_energy: np.ndarray) -> float:
-        if band_energy.size == 0:
-            return 0.0
-        noise_floor = float(np.percentile(band_energy, noise_floor_pct))
-        if noise_floor <= 0:
-            return 0.0
-        vocal = band_energy > threshold * noise_floor
-        vocal = _filter_short_runs(vocal, min_frames)
-        return 100.0 * float(np.mean(vocal))
+    female_result = _detect_band_activity(
+        female_energy,
+        threshold,
+        min_frames,
+        noise_floor_pct,
+        frame_hop_sec,
+        frame_span_sec,
+        start_sec,
+        "female",
+        female_freq,
+    )
+    male_result = _detect_band_activity(
+        male_energy,
+        threshold,
+        min_frames,
+        noise_floor_pct,
+        frame_hop_sec,
+        frame_span_sec,
+        start_sec,
+        "male",
+        male_freq,
+    )
 
-    return detect(female_energy), detect(male_energy), analyzed_duration
+    return {
+        "duration": analyzed_duration,
+        "female_pct": float(female_result["pct"]),
+        "male_pct": float(male_result["pct"]),
+        "segments": list(female_result["segments"]) + list(male_result["segments"]),
+        "detector": "heuristic",
+    }
+
+
+def analyze_media_file(
+    video_path: Path,
+    detector: str,
+    sample_rate: int,
+    n_fft: int,
+    hop_length: int,
+    female_freq: Tuple[float, float],
+    male_freq: Tuple[float, float],
+    threshold: float,
+    min_vocal_duration: float,
+    min_audio_rms: float,
+    noise_floor_pct: float,
+    start_sec: float = 0.0,
+    duration_sec: Optional[float] = None,
+) -> Dict[str, object]:
+    """Detector abstraction point for current heuristic and future model-based detectors."""
+    if detector == "heuristic":
+        return analyze_vocalizations_streaming(
+            video_path,
+            sample_rate,
+            n_fft,
+            hop_length,
+            female_freq,
+            male_freq,
+            threshold,
+            min_vocal_duration,
+            min_audio_rms,
+            noise_floor_pct,
+            start_sec=start_sec,
+            duration_sec=duration_sec,
+        )
+    raise ValueError(f"Unsupported detector: {detector}")
+
+
+def export_segments_json(results: List[dict], output_path: Path) -> None:
+    payload = {
+        "version": 1,
+        "files": [
+            {
+                "path": r["path"],
+                "name": r["name"],
+                "kind": r["kind"],
+                "duration": round(float(r["duration"] or 0.0), 3),
+                "female_pct": round(float(max(r.get("female_pct", -1.0), 0.0)), 3),
+                "male_pct": round(float(max(r.get("male_pct", -1.0), 0.0)), 3),
+                "detector": r.get("detector", "heuristic"),
+                "segments": r.get("segments", []),
+            }
+            for r in results
+        ],
+    }
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def format_duration(seconds: Optional[float]) -> str:
@@ -1464,6 +1629,7 @@ def _analyze_worker(video_path_str: str, params: Dict[str, object]) -> Dict[str,
     min_audio_rms   = float(params["min_audio_rms"]) # type: ignore[arg-type]
     noise_floor_pct = float(params["noise_floor_pct"])  # type: ignore[arg-type]
     clip_duration   = float(params["clip_duration"]) # type: ignore[arg-type]
+    detector        = str(params["detector"])        # type: ignore[arg-type]
 
     # When a clip duration is requested, seek to the end of the file.
     # We need the full duration from ffprobe to compute the start offset.
@@ -1479,8 +1645,9 @@ def _analyze_worker(video_path_str: str, params: Dict[str, object]) -> Dict[str,
         # else: file is shorter than clip_duration — analyze it entirely
 
     try:
-        female_pct, male_pct, analyzed_duration = analyze_vocalizations_streaming(
+        analysis = analyze_media_file(
             video_path,
+            detector,
             sample_rate,
             n_fft,
             hop_length,
@@ -1496,11 +1663,18 @@ def _analyze_worker(video_path_str: str, params: Dict[str, object]) -> Dict[str,
     except Exception:
         # Audio extraction failed; fall back to ffprobe for duration.
         duration = reported_duration or get_media_duration(video_path) or 0.0
-        return {"duration": duration, "female_pct": -1.0, "male_pct": -1.0}
+        return {
+            "duration": duration,
+            "female_pct": -1.0,
+            "male_pct": -1.0,
+            "segments": [],
+            "detector": detector,
+        }
 
     # Use ffprobe-reported full duration when clipping; otherwise derive from analyzed audio.
-    duration = reported_duration if reported_duration is not None else analyzed_duration
-    return {"duration": duration, "female_pct": female_pct, "male_pct": male_pct}
+    duration = reported_duration if reported_duration is not None else float(analysis["duration"])
+    analysis["duration"] = duration
+    return analysis
 
 
 def _make_result(video_path: Path, data: Dict[str, object], cached: bool) -> dict:
@@ -1513,6 +1687,8 @@ def _make_result(video_path: Path, data: Dict[str, object], cached: bool) -> dic
         "duration":   data.get("duration"),
         "female_pct": data.get("female_pct", -1.0),
         "male_pct":   data.get("male_pct",   -1.0),
+        "segments":   data.get("segments", []),
+        "detector":   data.get("detector", "heuristic"),
         "cached":     cached,
     }
 
@@ -1586,7 +1762,7 @@ def load_config(config_path: Path) -> Dict[str, object]:
         return {}
 
     defaults: Dict[str, object] = {}
-    str_keys   = ("output", "cache")
+    str_keys   = ("output", "cache", "segments_json", "detector")
     float_keys = ("threshold", "clip_duration", "min_vocal_duration", "min_audio_rms", "noise_floor_pct")
     int_keys   = ("sample_rate", "jobs", "n_fft", "hop_length")
     bool_keys  = ("no_cache", "force")
@@ -1660,6 +1836,14 @@ def main() -> None:
     parser.add_argument(
         "-o", "--output", default="screamfinder.html", metavar="FILE",
         help="Output HTML file",
+    )
+    parser.add_argument(
+        "--segments-json", default="", metavar="FILE",
+        help="Optional JSON export file for per-file segment timestamps and metadata",
+    )
+    parser.add_argument(
+        "--detector", choices=DETECTOR_CHOICES, default="heuristic",
+        help="Detection backend to use. 'heuristic' is the current streaming STFT detector.",
     )
     parser.add_argument(
         "-t", "--threshold", type=float, default=3.0, metavar="N",
@@ -1777,6 +1961,7 @@ def main() -> None:
         "min_vocal_duration": args.min_vocal_duration,
         "min_audio_rms":      args.min_audio_rms,
         "noise_floor_pct":    args.noise_floor_pct,
+        "detector":           args.detector,
     }
 
     # Pre-check cache in the main process; only submit uncached files to workers.
@@ -1818,7 +2003,13 @@ def main() -> None:
                     data = _analyze_worker(str(vp), params)
                 except Exception as exc:
                     print(f"ERROR analyzing {vp.name}: {exc}", file=sys.stderr)
-                    data = {"duration": 0.0, "female_pct": -1.0, "male_pct": -1.0}
+                    data = {
+                        "duration": 0.0,
+                        "female_pct": -1.0,
+                        "male_pct": -1.0,
+                        "segments": [],
+                        "detector": args.detector,
+                    }
                 results[i] = _make_result(vp, data, cached=False)
                 key = _cache_key(vp, params)
                 cache[key] = data
@@ -1838,7 +2029,13 @@ def main() -> None:
                         data = fut.result()
                     except Exception as exc:
                         print(f"ERROR analyzing {vp.name}: {exc}", file=sys.stderr)
-                        data = {"duration": 0.0, "female_pct": -1.0, "male_pct": -1.0}
+                        data = {
+                            "duration": 0.0,
+                            "female_pct": -1.0,
+                            "male_pct": -1.0,
+                            "segments": [],
+                            "detector": args.detector,
+                        }
                     results[i] = _make_result(vp, data, cached=False)
                     key = _cache_key(vp, params)
                     cache[key] = data
@@ -1853,6 +2050,11 @@ def main() -> None:
     abs_path = output_path.resolve()
     print(f"\nReport written to: {abs_path}", file=sys.stderr)
     print(f"Open in browser:  file://{abs_path}", file=sys.stderr)
+
+    if args.segments_json:
+        segments_path = Path(args.segments_json)
+        export_segments_json(results, segments_path)
+        print(f"Segments JSON:    {segments_path.resolve()}", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -125,6 +125,7 @@ python3 screamfinder.py [options] PATH [PATH ...]
 | Flag | Default | Description |
 |---|---|---|
 | `-o FILE`, `--output FILE` | `screamfinder.html` | Output HTML file |
+| `--segments-json FILE` | off | Optional JSON export with per-file detected segments and timestamps |
 | `--config FILE` | `screamfinder.toml` | TOML config file (CLI args override) |
 | `--jobs N` | `4` | Parallel analysis workers |
 | `--force` | off | Re-analyze every file, ignoring cache |
@@ -134,6 +135,7 @@ python3 screamfinder.py [options] PATH [PATH ...]
 
 | Flag | Default | Description |
 |---|---|---|
+| `--detector NAME` | `heuristic` | Detection backend. `heuristic` is the current streaming STFT detector and is the integration point future model-based detectors will share. |
 | `-t N`, `--threshold N` | `4.0` | A frame is counted as vocal when its band energy exceeds this multiple of the per-band noise floor. Raise to reduce false positives; lower to catch quieter vocalizations. |
 | `--female-freq LOW HIGH` | `500 2000` | Female vocalization frequency range (Hz) |
 | `--male-freq LOW HIGH` | `80 200` | Male vocalization frequency range (Hz) |
@@ -161,6 +163,8 @@ Results are cached to `.screamfinder-cache.json` so re-running on the same files
 
 Analysis now streams decoded PCM from `ffmpeg` in chunks instead of loading entire files into one in-memory array first, so very long media files use much less RAM during analysis. If you run with `--jobs 1`, analysis stays in the main process instead of starting a worker pool.
 
+When `--segments-json` is enabled, ScreamFinder also writes timestamped detected segments for each file. Those segment records are intended to be stable across detector backends so future `yamnet` or `panns` integrations can export through the same JSON shape.
+
 ---
 
 ## Configuration File
@@ -183,6 +187,8 @@ hop_length  = 1024
 
 jobs  = 4
 cache = ".screamfinder-cache.json"
+detector = "heuristic"
+segments_json = ""
 
 min_audio_rms   = 0.005
 noise_floor_pct = 10.0
@@ -212,6 +218,15 @@ Directories are searched recursively. Any format ffmpeg can decode will work for
 5. **Detection** — a frame is counted as "vocal" when its band energy exceeds `threshold × noise_floor`.
 6. **Sustained filter** — isolated bursts shorter than `--min-vocal-duration` seconds are discarded.
 7. **Result** — `female_pct` and `male_pct` are the percentage of frames that passed all filters.
+
+### Segment JSON
+
+If `--segments-json out.json` is provided, the export includes one entry per analyzed file with:
+
+- file path and name
+- detector name
+- overall percentages
+- a `segments` array with `label`, `start`, `end`, `duration`, `frame_count`, `peak_ratio`, `avg_ratio`, and frequency bounds
 
 ---
 

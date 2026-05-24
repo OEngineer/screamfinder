@@ -42,6 +42,13 @@ jobs = 4
 # Analysis result cache file (relative to the working directory)
 cache = ".screamfinder-cache.json"
 
+# Detection backend. "heuristic" is the current streaming STFT-based detector.
+detector = "heuristic"
+
+# Optional JSON export for per-file segment timestamps and metadata.
+# Leave empty to disable.
+segments_json = ""
+
 # Set to true to disable caching entirely
 no_cache = false
 
