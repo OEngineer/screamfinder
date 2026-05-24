@@ -33,7 +33,7 @@ except ImportError:
         tomllib = None  # type: ignore[assignment]
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 from scipy import signal as scipy_signal
@@ -55,6 +55,7 @@ AUDIO_EXTENSIONS = frozenset({
 })
 
 MEDIA_EXTENSIONS = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
+STREAM_CHUNK_SECONDS = 120.0
 
 
 def media_kind(path: Path) -> str:
@@ -1127,6 +1128,72 @@ def extract_audio(
         return None
 
 
+def iter_audio_chunks(
+    video_path: Path,
+    sample_rate: int,
+    start_sec: float = 0.0,
+    duration_sec: Optional[float] = None,
+    chunk_seconds: float = STREAM_CHUNK_SECONDS,
+) -> Iterator[np.ndarray]:
+    """Yield mono float32 audio chunks from ffmpeg without loading the whole file."""
+    chunk_samples = max(1, int(round(chunk_seconds * sample_rate)))
+    chunk_bytes = chunk_samples * np.dtype(np.float32).itemsize
+
+    cmd = ["ffmpeg"]
+    if start_sec > 0:
+        cmd += ["-ss", f"{start_sec:.3f}"]
+    cmd += ["-i", str(video_path)]
+    if duration_sec is not None and duration_sec > 0:
+        cmd += ["-t", f"{duration_sec:.3f}"]
+    cmd += [
+        "-vn",
+        "-acodec", "pcm_f32le",
+        "-ar", str(sample_rate),
+        "-ac", "1",
+        "-f", "f32le",
+        "-loglevel", "error",
+        "pipe:1",
+    ]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    leftover = b""
+    try:
+        assert proc.stdout is not None
+        while True:
+            block = proc.stdout.read(chunk_bytes)
+            if not block:
+                break
+            data = leftover + block
+            rem = len(data) % np.dtype(np.float32).itemsize
+            if rem:
+                leftover = data[-rem:]
+                data = data[:-rem]
+            else:
+                leftover = b""
+            if data:
+                yield np.frombuffer(data, dtype=np.float32).copy()
+
+        stderr = b""
+        if proc.stderr is not None:
+            stderr = proc.stderr.read()
+        ret = proc.wait(timeout=30)
+        if ret != 0:
+            detail = stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(detail or f"ffmpeg exited with status {ret}")
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+        if proc.stderr is not None:
+            proc.stderr.close()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
 def _filter_short_runs(vocal: np.ndarray, min_frames: int) -> np.ndarray:
     """Zero out runs of True that are shorter than min_frames."""
     if min_frames <= 1 or not np.any(vocal):
@@ -1218,6 +1285,120 @@ def analyze_vocalizations(
     return detect(female_mask), detect(male_mask)
 
 
+def analyze_vocalizations_streaming(
+    video_path: Path,
+    sample_rate: int,
+    n_fft: int = 2048,
+    hop_length: int = 512,
+    female_freq: Tuple[float, float] = (350.0, 2400.0),
+    male_freq: Tuple[float, float] = (100.0, 500.0),
+    threshold: float = 3.0,
+    min_vocal_duration: float = 0.5,
+    min_audio_rms: float = 0.005,
+    noise_floor_pct: float = 10.0,
+    start_sec: float = 0.0,
+    duration_sec: Optional[float] = None,
+) -> Tuple[float, float, float]:
+    """Stream audio from ffmpeg and compute the same metrics without full-file buffers."""
+    if n_fft <= 0 or hop_length <= 0 or hop_length > n_fft:
+        raise ValueError("n_fft and hop_length must be positive, and hop_length <= n_fft")
+
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / sample_rate)
+    nyquist = sample_rate / 2.0
+    flo_f = max(0.0, min(female_freq[0], nyquist))
+    fhi_f = max(0.0, min(female_freq[1], nyquist))
+    flo_m = max(0.0, min(male_freq[0], nyquist))
+    fhi_m = max(0.0, min(male_freq[1], nyquist))
+
+    female_mask = (freqs >= flo_f) & (freqs <= fhi_f)
+    male_mask = (freqs >= flo_m) & (freqs <= fhi_m)
+    overlap_samples = max(0, n_fft - hop_length)
+    duplicate_frames = (
+        (overlap_samples + hop_length - 1) // hop_length if overlap_samples > 0 else 0
+    )
+
+    total_samples = 0
+    sum_squares = 0.0
+    carry = np.empty(0, dtype=np.float32)
+    first_chunk = True
+    female_energy_chunks: List[np.ndarray] = []
+    male_energy_chunks: List[np.ndarray] = []
+
+    for chunk in iter_audio_chunks(
+        video_path,
+        sample_rate,
+        start_sec=start_sec,
+        duration_sec=duration_sec,
+    ):
+        if chunk.size == 0:
+            continue
+        total_samples += int(chunk.size)
+        sum_squares += float(np.dot(chunk, chunk))
+
+        work = np.concatenate((carry, chunk)) if carry.size else chunk
+        if work.size < n_fft:
+            carry = work
+            first_chunk = False
+            continue
+
+        _freqs, _times, Zxx = scipy_signal.stft(
+            work,
+            fs=sample_rate,
+            nperseg=n_fft,
+            noverlap=n_fft - hop_length,
+            window="hann",
+            boundary=None,
+            padded=False,
+        )
+        mag_sq = np.abs(Zxx) ** 2
+        start_col = 0 if first_chunk else duplicate_frames
+
+        if np.any(female_mask):
+            band = np.mean(mag_sq[female_mask], axis=0)
+            if start_col < band.size:
+                female_energy_chunks.append(band[start_col:].copy())
+        if np.any(male_mask):
+            band = np.mean(mag_sq[male_mask], axis=0)
+            if start_col < band.size:
+                male_energy_chunks.append(band[start_col:].copy())
+
+        if overlap_samples > 0:
+            carry = work[-overlap_samples:].copy()
+        else:
+            carry = np.empty(0, dtype=np.float32)
+        first_chunk = False
+
+    analyzed_duration = total_samples / sample_rate if total_samples > 0 else 0.0
+    if total_samples < n_fft:
+        return 0.0, 0.0, analyzed_duration
+
+    audio_rms = float(np.sqrt(sum_squares / total_samples)) if total_samples > 0 else 0.0
+    if audio_rms < min_audio_rms:
+        return 0.0, 0.0, analyzed_duration
+
+    frames_per_sec = sample_rate / hop_length
+    min_frames = max(1, int(round(min_vocal_duration * frames_per_sec)))
+
+    female_energy = (
+        np.concatenate(female_energy_chunks) if female_energy_chunks else np.empty(0, dtype=np.float32)
+    )
+    male_energy = (
+        np.concatenate(male_energy_chunks) if male_energy_chunks else np.empty(0, dtype=np.float32)
+    )
+
+    def detect(band_energy: np.ndarray) -> float:
+        if band_energy.size == 0:
+            return 0.0
+        noise_floor = float(np.percentile(band_energy, noise_floor_pct))
+        if noise_floor <= 0:
+            return 0.0
+        vocal = band_energy > threshold * noise_floor
+        vocal = _filter_short_runs(vocal, min_frames)
+        return 100.0 * float(np.mean(vocal))
+
+    return detect(female_energy), detect(male_energy), analyzed_duration
+
+
 def format_duration(seconds: Optional[float]) -> str:
     if seconds is None or seconds < 0:
         return "?"
@@ -1297,19 +1478,28 @@ def _analyze_worker(video_path_str: str, params: Dict[str, object]) -> Dict[str,
             extract_dur = clip_duration
         # else: file is shorter than clip_duration — analyze it entirely
 
-    audio = extract_audio(video_path, sample_rate, start_sec=start_sec, duration_sec=extract_dur)
-    if audio is None:
+    try:
+        female_pct, male_pct, analyzed_duration = analyze_vocalizations_streaming(
+            video_path,
+            sample_rate,
+            n_fft,
+            hop_length,
+            female_freq,
+            male_freq,
+            threshold,
+            min_voc_dur,
+            min_audio_rms,
+            noise_floor_pct,
+            start_sec=start_sec,
+            duration_sec=extract_dur,
+        )
+    except Exception:
         # Audio extraction failed; fall back to ffprobe for duration.
         duration = reported_duration or get_media_duration(video_path) or 0.0
         return {"duration": duration, "female_pct": -1.0, "male_pct": -1.0}
 
-    # Use ffprobe-reported full duration when clipping; otherwise derive from audio.
-    duration = reported_duration if reported_duration is not None else len(audio) / sample_rate
-    female_pct, male_pct = analyze_vocalizations(
-        audio, sample_rate, n_fft, hop_length,
-        female_freq, male_freq, threshold, min_voc_dur,  # type: ignore[arg-type]
-        min_audio_rms, noise_floor_pct,
-    )
+    # Use ffprobe-reported full duration when clipping; otherwise derive from analyzed audio.
+    duration = reported_duration if reported_duration is not None else analyzed_duration
     return {"duration": duration, "female_pct": female_pct, "male_pct": male_pct}
 
 
@@ -1619,18 +1809,13 @@ def main() -> None:
         else:
             to_run.append((i, vp))
 
-    # Analyze uncached files with ProcessPoolExecutor (true CPU parallelism).
-    # Workers are pure-computation top-level functions; cache I/O stays in main.
+    # Analyze uncached files. For a single worker, stay in-process so local
+    # debugging and constrained environments do not need multiprocessing.
     if to_run:
-        with ProcessPoolExecutor(max_workers=args.jobs) as pool:
-            futs = {
-                pool.submit(_analyze_worker, str(vp), params): (i, vp)
-                for i, vp in to_run
-            }
-            for fut in as_completed(futs):
-                i, vp = futs[fut]
+        if args.jobs <= 1:
+            for i, vp in to_run:
                 try:
-                    data = fut.result()
+                    data = _analyze_worker(str(vp), params)
                 except Exception as exc:
                     print(f"ERROR analyzing {vp.name}: {exc}", file=sys.stderr)
                     data = {"duration": 0.0, "female_pct": -1.0, "male_pct": -1.0}
@@ -1640,6 +1825,26 @@ def main() -> None:
                 if cache_path:
                     save_cache(cache_path, cache)
                 _print_progress(vp.name, data, cached=False)
+        else:
+            # Workers are pure-computation top-level functions; cache I/O stays in main.
+            with ProcessPoolExecutor(max_workers=args.jobs) as pool:
+                futs = {
+                    pool.submit(_analyze_worker, str(vp), params): (i, vp)
+                    for i, vp in to_run
+                }
+                for fut in as_completed(futs):
+                    i, vp = futs[fut]
+                    try:
+                        data = fut.result()
+                    except Exception as exc:
+                        print(f"ERROR analyzing {vp.name}: {exc}", file=sys.stderr)
+                        data = {"duration": 0.0, "female_pct": -1.0, "male_pct": -1.0}
+                    results[i] = _make_result(vp, data, cached=False)
+                    key = _cache_key(vp, params)
+                    cache[key] = data
+                    if cache_path:
+                        save_cache(cache_path, cache)
+                    _print_progress(vp.name, data, cached=False)
 
     # Generate HTML
     html = generate_html(results, args)

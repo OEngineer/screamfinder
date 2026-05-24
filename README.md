@@ -159,6 +159,8 @@ python3 screamfinder.py [options] PATH [PATH ...]
 
 Results are cached to `.screamfinder-cache.json` so re-running on the same files is nearly instant. The cache key includes the file path, modification time, size, and every analysis parameter, so changing any setting automatically re-analyzes affected files.
 
+Analysis now streams decoded PCM from `ffmpeg` in chunks instead of loading entire files into one in-memory array first, so very long media files use much less RAM during analysis. If you run with `--jobs 1`, analysis stays in the main process instead of starting a worker pool.
+
 ---
 
 ## Configuration File
@@ -203,6 +205,7 @@ Directories are searched recursively. Any format ffmpeg can decode will work for
 ## How It Works
 
 1. **Audio extraction** — ffmpeg decodes the audio track to mono PCM at `--sample-rate` Hz.
+   The decoder output is consumed in streaming chunks, so long files do not need to fit in RAM all at once.
 2. **STFT** — a Short-Time Fourier Transform (window = `--n-fft`, hop = `--hop-length`) produces per-frame frequency energy.
 3. **Per-band noise floor** — for each frequency band (female or male), the `--noise-floor-pct`-th percentile of that band's frame energies is used as the noise floor. This adapts to whatever constant background noise (hiss, music, etc.) is present.
 4. **Silence gate** — files whose whole-file RMS is below `--min-audio-rms` are scored 0% immediately.
