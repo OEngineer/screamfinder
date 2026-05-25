@@ -485,10 +485,23 @@ tr:hover td { background: var(--surface2); }
   flex-shrink: 0;
 }
 
-.player-title {
+.player-title-wrap {
   flex: 1;
+  min-width: 0;
+}
+
+.player-title {
   font-size: 13px;
   color: #bbb;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.player-subtitle {
+  margin-top: 3px;
+  font-size: 11px;
+  color: #777;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1010,6 +1023,8 @@ const modal          = document.getElementById('player-modal');
 const playerWrap     = document.getElementById('player-wrap');
 const video          = document.getElementById('player');
 const playerControls = document.getElementById('player-controls');
+const playerTitleEl   = document.getElementById('player-title');
+const playerSubtitleEl = document.getElementById('player-subtitle');
 const playerError     = document.getElementById('player-error');
 const playerErrDetail = document.getElementById('player-error-detail');
 const playerErrPath   = document.getElementById('player-error-path');
@@ -1425,7 +1440,8 @@ function openPlayer(idx, opts = {}) {
   const defaultSeekTime = firstHotspotSeekForItem(idx);
   const requestedSeekTime = Number.isFinite(opts.seekTime) ? opts.seekTime : defaultSeekTime;
   pendingSeekTime = Number.isFinite(requestedSeekTime) ? requestedSeekTime : null;
-  document.getElementById('player-title').textContent = item.name;
+  playerTitleEl.textContent = item.name;
+  playerSubtitleEl.textContent = item.parent_dir || '';
   playerError.classList.add('hidden');
   playerControls.style.display = '';
   playerWrap.classList.toggle('is-audio', isAudio);
@@ -1479,6 +1495,8 @@ function closePlayer() {
   playerWrap.classList.remove('is-audio');
   audioCover.classList.add('hidden');
   audioCoverName.textContent = '';
+  playerTitleEl.textContent = '';
+  playerSubtitleEl.textContent = '';
   currentItemIdx = null;
   autoNext = false;
   activeHotspots = [];
@@ -1815,11 +1833,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </div>
 
 <!-- Video Player Modal -->
-<div id="player-modal" class="modal hidden">
+  <div id="player-modal" class="modal hidden">
   <div id="modal-backdrop" class="modal-backdrop"></div>
   <div id="player-wrap" class="player-wrap">
     <div class="player-header">
-      <span id="player-title" class="player-title"></span>
+      <div class="player-title-wrap">
+        <div id="player-title" class="player-title"></div>
+        <div id="player-subtitle" class="player-subtitle"></div>
+      </div>
       <button class="hdr-btn" onclick="closePlayer()" title="Close (Esc)">✕</button>
     </div>
     <div class="player-media">
@@ -3078,6 +3099,7 @@ def generate_html(results: List[dict], args: argparse.Namespace) -> str:
     for r in results:
         dur = r["duration"] or 0
         segments = list(r.get("segments", []))
+        parent_dir = Path(r["path"]).parent.name or str(Path(r["path"]).parent)
         positive_duration = _union_duration(
             sorted(
                 (
@@ -3090,6 +3112,7 @@ def generate_html(results: List[dict], args: argparse.Namespace) -> str:
         )
         js_data.append({
             "name":         r["name"],
+            "parent_dir":   parent_dir,
             "url":          r["url"],
             "kind":         r.get("kind", "video"),
             "duration":     round(dur, 3),
