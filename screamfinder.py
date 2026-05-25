@@ -749,6 +749,7 @@ tr:hover td { background: var(--surface2); }
   display: flex;
   gap: 8px;
   margin-bottom: 10px;
+  justify-content: flex-end;
 }
 
 .hotspot-settings {
@@ -1912,6 +1913,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <button id="btn-prev-hotspot" class="ctrl-btn" onclick="jumpPrevHotspot()" title="Previous hotspot ([)">← hotspot</button>
           <button id="btn-next-hotspot" class="ctrl-btn" onclick="jumpNextHotspot()" title="Next hotspot (])">hotspot →</button>
         </div>
+        <div class="file-nav-row">
+          <button id="btn-prev-file" class="ctrl-btn" onclick="jumpPrevFile()" title="Previous file">← file</button>
+          <button id="btn-next-file" class="ctrl-btn" onclick="playNextInSequence()" title="Next file">file →</button>
+        </div>
         <div id="hotspot-settings" class="hotspot-settings">
           <div class="hotspot-setting">
             <label for="hotspot-merge-gap">Merge gap (s)</label>
@@ -1932,10 +1937,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
         <div class="hotspot-settings-note">Live changes only affect this report view and use the detected segments already embedded in it.</div>
         <div id="hotspot-list" class="hotspot-list"></div>
-      </div>
-      <div class="file-nav-row">
-        <button id="btn-prev-file" class="ctrl-btn" onclick="jumpPrevFile()" title="Previous file">← file</button>
-        <button id="btn-next-file" class="ctrl-btn" onclick="playNextInSequence()" title="Next file">file →</button>
       </div>
       <div class="ctrl-row">
         <button id="btn-play" class="ctrl-btn" onclick="togglePlay()" title="Play/Pause (Space)">▶</button>
