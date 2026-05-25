@@ -730,6 +730,46 @@ tr:hover td { background: var(--surface2); }
   color: #bcbcd6;
 }
 
+.hotspot-settings {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.hotspot-setting {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.hotspot-setting label {
+  font-size: 11px;
+  color: #bcbcd6;
+}
+
+.hotspot-setting input {
+  width: 100%;
+  padding: 5px 7px;
+  border-radius: 6px;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(0,0,0,0.18);
+  color: #fff;
+  font-size: 12px;
+}
+
+.hotspot-setting input:focus {
+  outline: none;
+  border-color: rgba(255, 193, 7, 0.55);
+  box-shadow: 0 0 0 2px rgba(255, 193, 7, 0.12);
+}
+
+.hotspot-settings-note {
+  margin-bottom: 8px;
+  font-size: 11px;
+  color: rgba(255,255,255,0.58);
+}
+
 .hotspot-list {
   display: flex;
   flex-wrap: wrap;
@@ -800,6 +840,18 @@ tr:hover td { background: var(--surface2); }
   white-space: nowrap;
 }
 
+@media (max-width: 900px) {
+  .hotspot-settings {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 560px) {
+  .hotspot-settings {
+    grid-template-columns: 1fr;
+  }
+}
+
 .hidden-metric { display: none !important; }
 
 /* Cursor hiding when controls hidden and playing */
@@ -814,6 +866,20 @@ JS = r"""
 // ── Data injected above ───────────────────────────────────────────────────
 
 const maxDuration = Math.max(...DATA.map(d => d.duration), 1);
+const DEFAULT_HOTSPOT_CONFIG = {
+  mergeGap: <<<HOTSPOT_MERGE_GAP>>>,
+  padding: <<<HOTSPOT_PADDING>>>,
+  minDuration: <<<HOTSPOT_MIN_DURATION>>>,
+  seekPreroll: <<<HOTSPOT_SEEK_PREROLL>>>,
+};
+let hotspotConfig = { ...DEFAULT_HOTSPOT_CONFIG };
+let hotspotRefreshTimer = null;
+
+DATA.forEach((item) => {
+  item.segments = Array.isArray(item.segments) ? item.segments : [];
+  item._serverHotspots = Array.isArray(item.hotspots) ? item.hotspots.slice() : [];
+});
+const maxPositiveDuration = Math.max(...DATA.map(d => d.positive_duration || 0), 1);
 
 // ── Scoring ───────────────────────────────────────────────────────────────
 
@@ -826,7 +892,7 @@ function getWeights() {
 }
 
 function computeScore(item, w) {
-  return w.dur * (item.duration / maxDuration)
+  return w.dur * ((item.positive_duration || 0) / maxPositiveDuration)
        + w.fem * (item.female_pct / 100)
        + (HAS_SECOND_METRIC ? w.mal * (item.male_pct / 100) : 0);
 }
@@ -954,6 +1020,10 @@ const hotspotSummary = document.getElementById('hotspot-summary');
 const hotspotList    = document.getElementById('hotspot-list');
 const prevHotspotBtn = document.getElementById('btn-prev-hotspot');
 const nextHotspotBtn = document.getElementById('btn-next-hotspot');
+const hotspotMergeGapInput = document.getElementById('hotspot-merge-gap');
+const hotspotPaddingInput = document.getElementById('hotspot-padding');
+const hotspotMinDurationInput = document.getElementById('hotspot-min-duration');
+const hotspotSeekPrerollInput = document.getElementById('hotspot-seek-preroll');
 
 let isDragging    = false;
 let savedVol      = 1;
@@ -962,9 +1032,181 @@ let currentItemIdx = null;
 let autoNext       = false;
 let activeHotspots = [];
 let activeHotspotIdx = -1;
+let autoAdvancePendingHotspotIdx = -1;
+let pendingSeekTime = null;
 
 function clamp01(n) {
   return Math.max(0, Math.min(1, n));
+}
+
+function roundTo(value, digits) {
+  return Number(value.toFixed(digits));
+}
+
+function segmentStrength(segment) {
+  for (const key of ['peak_score', 'avg_score', 'peak_ratio', 'avg_ratio']) {
+    const value = Number(segment?.[key]);
+    if (Number.isFinite(value)) return value;
+  }
+  return 0;
+}
+
+function unionDuration(intervals) {
+  if (!intervals.length) return 0;
+  let total = 0;
+  let [curStart, curEnd] = intervals[0];
+  for (const [start, end] of intervals.slice(1)) {
+    if (start <= curEnd) {
+      curEnd = Math.max(curEnd, end);
+      continue;
+    }
+    total += Math.max(0, curEnd - curStart);
+    [curStart, curEnd] = [start, end];
+  }
+  total += Math.max(0, curEnd - curStart);
+  return total;
+}
+
+function buildHotspotsFromSegments(segments, duration, config) {
+  if (!Array.isArray(segments) || segments.length === 0) return [];
+  const maxDur = Number.isFinite(duration) && duration > 0 ? duration : null;
+  const ordered = segments
+    .filter((seg) => Number(seg?.end) > Number(seg?.start))
+    .slice()
+    .sort((a, b) => Number(a.start) - Number(b.start) || Number(a.end) - Number(b.end));
+  if (!ordered.length) return [];
+
+  const clusters = [];
+  let current = [ordered[0]];
+  let currentEnd = Number(ordered[0].end);
+  for (const seg of ordered.slice(1)) {
+    const segStart = Number(seg.start);
+    const segEnd = Number(seg.end);
+    if (segStart <= currentEnd + config.mergeGap) {
+      current.push(seg);
+      currentEnd = Math.max(currentEnd, segEnd);
+      continue;
+    }
+    clusters.push(current);
+    current = [seg];
+    currentEnd = segEnd;
+  }
+  clusters.push(current);
+
+  return clusters.map((cluster) => {
+    const rawStart = Number(cluster[0].start);
+    const rawEnd = Math.max(...cluster.map((seg) => Number(seg.end)));
+    const rawSpan = Math.max(0, rawEnd - rawStart);
+    if (rawSpan <= 0) return null;
+
+    const intervals = cluster
+      .map((seg) => [Number(seg.start), Number(seg.end)])
+      .sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const positiveDuration = unionDuration(intervals);
+    const density = rawSpan > 0 ? positiveDuration / rawSpan : 0;
+    const peakStrength = Math.max(...cluster.map((seg) => segmentStrength(seg)), 0);
+    const labels = [...new Set(cluster.map((seg) => String(seg.label || 'vocalization')))].sort();
+
+    let navStart = Math.max(0, rawStart - config.padding);
+    let navEnd = rawEnd + config.padding;
+    if (maxDur !== null) navEnd = Math.min(maxDur, navEnd);
+    let navSpan = navEnd - navStart;
+
+    if (navSpan < config.minDuration) {
+      const center = (rawStart + rawEnd) / 2;
+      const half = config.minDuration / 2;
+      navStart = Math.max(0, center - half);
+      navEnd = center + half;
+      if (maxDur !== null) {
+        if (navEnd > maxDur) {
+          navEnd = maxDur;
+          navStart = Math.max(0, navEnd - config.minDuration);
+        } else {
+          navStart = Math.max(0, navStart);
+        }
+      }
+      navSpan = navEnd - navStart;
+    }
+
+    let seekTo = Math.max(0, rawStart - config.seekPreroll);
+    if (maxDur !== null) seekTo = Math.min(maxDur, seekTo);
+
+    return {
+      start: roundTo(navStart, 3),
+      end: roundTo(navEnd, 3),
+      seek_to: roundTo(seekTo, 3),
+      duration: roundTo(Math.max(0, navSpan), 3),
+      raw_start: roundTo(rawStart, 3),
+      raw_end: roundTo(rawEnd, 3),
+      positive_duration: roundTo(positiveDuration, 3),
+      density: roundTo(density, 4),
+      peak_strength: roundTo(peakStrength, 4),
+      segment_count: cluster.length,
+      labels,
+    };
+  }).filter(Boolean);
+}
+
+function parseHotspotConfigValue(input, fallback, min = 0, max = 999) {
+  const value = Number(input?.value);
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, value));
+}
+
+function readHotspotConfigFromInputs() {
+  hotspotConfig = {
+    mergeGap: parseHotspotConfigValue(hotspotMergeGapInput, DEFAULT_HOTSPOT_CONFIG.mergeGap, 0, 240),
+    padding: parseHotspotConfigValue(hotspotPaddingInput, DEFAULT_HOTSPOT_CONFIG.padding, 0, 240),
+    minDuration: parseHotspotConfigValue(hotspotMinDurationInput, DEFAULT_HOTSPOT_CONFIG.minDuration, 1, 360),
+    seekPreroll: parseHotspotConfigValue(hotspotSeekPrerollInput, DEFAULT_HOTSPOT_CONFIG.seekPreroll, 0, 60),
+  };
+}
+
+function writeHotspotConfigToInputs() {
+  hotspotMergeGapInput.value = hotspotConfig.mergeGap;
+  hotspotPaddingInput.value = hotspotConfig.padding;
+  hotspotMinDurationInput.value = hotspotConfig.minDuration;
+  hotspotSeekPrerollInput.value = hotspotConfig.seekPreroll;
+}
+
+function setHotspotInputsDisabled(disabled) {
+  [hotspotMergeGapInput, hotspotPaddingInput, hotspotMinDurationInput, hotspotSeekPrerollInput].forEach((input) => {
+    input.disabled = disabled;
+  });
+}
+
+function itemHasAdjustableHotspots(item) {
+  return !!(item && Array.isArray(item.segments) && item.segments.length > 0);
+}
+
+function deriveHotspotsForItem(item) {
+  if (itemHasAdjustableHotspots(item)) {
+    return buildHotspotsFromSegments(item.segments, item.duration, hotspotConfig);
+  }
+  return Array.isArray(item?._serverHotspots) ? item._serverHotspots.slice() : [];
+}
+
+function refreshHotspotsForAllItems() {
+  DATA.forEach((item) => {
+    item.hotspots = deriveHotspotsForItem(item);
+  });
+}
+
+function refreshCurrentItemHotspots() {
+  if (currentItemIdx === null) return;
+  const item = DATA[currentItemIdx];
+  item.hotspots = deriveHotspotsForItem(item);
+  renderHotspots(item.hotspots || []);
+  updateProgress();
+}
+
+function scheduleHotspotRefresh() {
+  clearTimeout(hotspotRefreshTimer);
+  hotspotRefreshTimer = setTimeout(() => {
+    readHotspotConfigFromInputs();
+    refreshHotspotsForAllItems();
+    refreshCurrentItemHotspots();
+  }, 100);
 }
 
 function hotspotTitle(hotspot, idx) {
@@ -980,10 +1222,13 @@ function hotspotChipText(hotspot, idx) {
 function syncHotspotButtons() {
   const hasHotspots = activeHotspots.length > 0;
   prevHotspotBtn.disabled = !hasHotspots || prevHotspotIndex() === -1;
-  nextHotspotBtn.disabled = !hasHotspots || nextHotspotIndex() === -1;
+  nextHotspotBtn.disabled = !hasHotspots || !hasNextHotspotJump();
 }
 
 function setActiveHotspot(idx) {
+  if (idx !== activeHotspotIdx) {
+    autoAdvancePendingHotspotIdx = idx;
+  }
   activeHotspotIdx = idx;
   hotspotTrack.querySelectorAll('.hotspot-marker').forEach((el, markerIdx) => {
     el.classList.toggle('active', markerIdx === idx);
@@ -996,6 +1241,14 @@ function setActiveHotspot(idx) {
 
 function currentHotspotIndexForTime(time) {
   return activeHotspots.findIndex(hotspot => time >= hotspot.start && time <= hotspot.end);
+}
+
+function nextItemIndexInPlaylist() {
+  if (currentItemIdx === null) return null;
+  const pos = playlistOrder.indexOf(currentItemIdx);
+  const nextIdx = pos >= 0 ? playlistOrder[pos + 1] : currentItemIdx + 1;
+  if (nextIdx === undefined || nextIdx >= DATA.length) return null;
+  return nextIdx;
 }
 
 function prevHotspotIndex() {
@@ -1020,6 +1273,11 @@ function nextHotspotIndex() {
   return idx;
 }
 
+function hasNextHotspotJump() {
+  if (nextHotspotIndex() >= 0) return true;
+  return nextItemIndexInPlaylist() !== null;
+}
+
 function jumpToHotspot(idx) {
   if (idx < 0 || idx >= activeHotspots.length || !video.duration) return;
   const hotspot = activeHotspots[idx];
@@ -1029,6 +1287,14 @@ function jumpToHotspot(idx) {
   showControls();
 }
 
+function firstHotspotSeekForItem(idx) {
+  const item = DATA[idx];
+  if (!item) return null;
+  item.hotspots = deriveHotspotsForItem(item);
+  if (!Array.isArray(item.hotspots) || item.hotspots.length === 0) return null;
+  return item.hotspots[0].seek_to ?? item.hotspots[0].start ?? null;
+}
+
 function jumpPrevHotspot() {
   const idx = prevHotspotIndex();
   if (idx >= 0) jumpToHotspot(idx);
@@ -1036,18 +1302,34 @@ function jumpPrevHotspot() {
 
 function jumpNextHotspot() {
   const idx = nextHotspotIndex();
-  if (idx >= 0) jumpToHotspot(idx);
+  if (idx >= 0) {
+    jumpToHotspot(idx);
+    return;
+  }
+  const nextIdx = nextItemIndexInPlaylist();
+  if (nextIdx === null) return;
+  openPlayer(nextIdx, { seekTime: firstHotspotSeekForItem(nextIdx) ?? 0 });
 }
 
 function renderHotspots(hotspots) {
+  const item = currentItemIdx !== null ? DATA[currentItemIdx] : null;
+  const hasAdjustableHotspots = itemHasAdjustableHotspots(item);
+  setHotspotInputsDisabled(!hasAdjustableHotspots);
   activeHotspots = Array.isArray(hotspots) ? hotspots.slice().sort((a, b) => a.start - b.start) : [];
   activeHotspotIdx = -1;
+  autoAdvancePendingHotspotIdx = -1;
   hotspotTrack.innerHTML = '';
   hotspotList.innerHTML = '';
 
   if (activeHotspots.length === 0) {
-    hotspotPanel.classList.add('hidden');
-    hotspotSummary.textContent = '';
+    if (!hasAdjustableHotspots) {
+      hotspotPanel.classList.add('hidden');
+      hotspotSummary.textContent = '';
+      syncHotspotButtons();
+      return;
+    }
+    hotspotPanel.classList.remove('hidden');
+    hotspotSummary.textContent = 'No hotspots at the current clustering settings.';
     syncHotspotButtons();
     return;
   }
@@ -1090,16 +1372,18 @@ function renderHotspots(hotspots) {
 }
 
 // Open / close
-function openPlayer(idx) {
+function openPlayer(idx, opts = {}) {
   const item = DATA[idx];
   const isAudio = item.kind === 'audio';
   currentItemIdx = idx;
+  pendingSeekTime = Number.isFinite(opts.seekTime) ? opts.seekTime : null;
   document.getElementById('player-title').textContent = item.name;
   playerError.classList.add('hidden');
   playerControls.style.display = '';
   playerWrap.classList.toggle('is-audio', isAudio);
   audioCover.classList.toggle('hidden', !isAudio);
   audioCoverName.textContent = isAudio ? item.name : '';
+  item.hotspots = deriveHotspotsForItem(item);
   video.src = item.url;
   renderHotspots(item.hotspots || []);
   modal.classList.remove('hidden');
@@ -1149,6 +1433,8 @@ function closePlayer() {
   autoNext = false;
   activeHotspots = [];
   activeHotspotIdx = -1;
+  autoAdvancePendingHotspotIdx = -1;
+  pendingSeekTime = null;
   hotspotTrack.innerHTML = '';
   hotspotList.innerHTML = '';
   hotspotPanel.classList.add('hidden');
@@ -1199,10 +1485,10 @@ function togglePlay() {
 function updateAutoNextButton() {
   autoNextBtn.classList.toggle('active', autoNext);
   autoNextBtn.setAttribute('aria-pressed', autoNext ? 'true' : 'false');
-  autoNextBtn.textContent = autoNext ? 'Auto next: On' : 'Auto next: Off';
+  autoNextBtn.textContent = autoNext ? 'Auto next hotspot: On' : 'Auto next hotspot: Off';
   autoNextBtn.title = autoNext
-    ? 'Auto-play next file: on'
-    : 'Auto-play next file: off';
+    ? 'Auto-advance through hotspots and into the next file: on'
+    : 'Auto-advance through hotspots and into the next file: off';
 }
 
 function toggleAutoNext() {
@@ -1212,12 +1498,22 @@ function toggleAutoNext() {
 }
 
 function playNextInSequence() {
-  if (currentItemIdx === null) return false;
-  const pos = playlistOrder.indexOf(currentItemIdx);
-  const nextIdx = pos >= 0 ? playlistOrder[pos + 1] : currentItemIdx + 1;
-  if (nextIdx === undefined || nextIdx >= DATA.length) return false;
-  openPlayer(nextIdx);
+  const nextIdx = nextItemIndexInPlaylist();
+  if (nextIdx === null) return false;
+  const nextSeekTime = autoNext ? firstHotspotSeekForItem(nextIdx) : null;
+  openPlayer(nextIdx, { seekTime: nextSeekTime });
   return true;
+}
+
+function autoAdvanceFromCurrentHotspot() {
+  const idx = activeHotspotIdx >= 0 ? activeHotspotIdx : currentHotspotIndexForTime(video.currentTime || 0);
+  if (idx < 0 || idx >= activeHotspots.length) return false;
+  const nextIdx = activeHotspots.findIndex((hotspot, hotspotIdx) => hotspotIdx > idx && hotspot.seek_to > activeHotspots[idx].end);
+  if (nextIdx >= 0) {
+    jumpToHotspot(nextIdx);
+    return true;
+  }
+  return playNextInSequence();
 }
 
 function seek(delta) {
@@ -1281,7 +1577,18 @@ function updateProgress() {
     progressBuf.style.width = `${bp * 100}%`;
   }
   if (activeHotspots.length > 0) {
-    setActiveHotspot(currentHotspotIndexForTime(cur));
+    const idx = currentHotspotIndexForTime(cur);
+    setActiveHotspot(idx);
+    if (
+      autoNext &&
+      idx >= 0 &&
+      idx === autoAdvancePendingHotspotIdx &&
+      cur >= activeHotspots[idx].end - 0.12
+    ) {
+      autoAdvancePendingHotspotIdx = -1;
+      autoAdvanceFromCurrentHotspot();
+      return;
+    }
   } else {
     syncHotspotButtons();
   }
@@ -1307,9 +1614,20 @@ video.addEventListener('timeupdate',    updateProgress);
 video.addEventListener('durationchange', updateProgress);
 video.addEventListener('loadedmetadata', () => {
   if (currentItemIdx !== null) renderHotspots(DATA[currentItemIdx].hotspots || []);
+  if (pendingSeekTime !== null && Number.isFinite(pendingSeekTime)) {
+    const target = Math.max(0, Math.min(video.duration || pendingSeekTime, pendingSeekTime));
+    video.currentTime = target;
+  }
+  pendingSeekTime = null;
   updateProgress();
 });
-video.addEventListener('ended',         () => { if (autoNext) playNextInSequence(); });
+video.addEventListener('ended',         () => {
+  if (!autoNext) return;
+  if (activeHotspots.length > 0) {
+    autoAdvancePendingHotspotIdx = -1;
+  }
+  playNextInSequence();
+});
 video.addEventListener('click',         () => { togglePlay(); showControls(); });
 video.addEventListener('dblclick',      reqFullscreen);
 
@@ -1364,6 +1682,13 @@ document.addEventListener('keydown', e => {
 });
 
 // Init
+writeHotspotConfigToInputs();
+setHotspotInputsDisabled(true);
+[hotspotMergeGapInput, hotspotPaddingInput, hotspotMinDurationInput, hotspotSeekPrerollInput].forEach((input) => {
+  input.addEventListener('input', scheduleHotspotRefresh);
+  input.addEventListener('change', scheduleHotspotRefresh);
+});
+refreshHotspotsForAllItems();
 updateAutoNextButton();
 renderTable();
 """
@@ -1391,7 +1716,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="controls-title">Sort Weights</div>
   <div class="sliders">
     <div class="slider-group">
-      <label><span class="swatch" style="background:#7878a0"></span>Duration</label>
+      <label><span class="swatch" style="background:#7878a0"></span>Positive Time</label>
       <input type="range" id="w-dur" min="0" max="5" step="0.1" value="1.0">
       <span class="slider-val" id="w-dur-val">1.0</span>
     </div>
@@ -1468,6 +1793,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <button id="btn-prev-hotspot" class="ctrl-btn" onclick="jumpPrevHotspot()" title="Previous hotspot ([)">← hotspot</button>
           <button id="btn-next-hotspot" class="ctrl-btn" onclick="jumpNextHotspot()" title="Next hotspot (])">hotspot →</button>
         </div>
+        <div id="hotspot-settings" class="hotspot-settings">
+          <div class="hotspot-setting">
+            <label for="hotspot-merge-gap">Merge gap (s)</label>
+            <input id="hotspot-merge-gap" type="number" min="0" max="120" step="0.5">
+          </div>
+          <div class="hotspot-setting">
+            <label for="hotspot-padding">Padding (s)</label>
+            <input id="hotspot-padding" type="number" min="0" max="120" step="0.5">
+          </div>
+          <div class="hotspot-setting">
+            <label for="hotspot-min-duration">Min duration (s)</label>
+            <input id="hotspot-min-duration" type="number" min="1" max="180" step="0.5">
+          </div>
+          <div class="hotspot-setting">
+            <label for="hotspot-seek-preroll">Seek preroll (s)</label>
+            <input id="hotspot-seek-preroll" type="number" min="0" max="30" step="0.5">
+          </div>
+        </div>
+        <div class="hotspot-settings-note">Live changes only affect this report view and use the detected segments already embedded in it.</div>
         <div id="hotspot-list" class="hotspot-list"></div>
       </div>
       <div class="ctrl-row">
@@ -1476,7 +1820,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <button class="ctrl-btn" onclick="seek(-5)"  title="Back 5s (←)">⏪ 5s</button>
         <button class="ctrl-btn" onclick="seek(5)"   title="Fwd 5s (→)">5s ⏩</button>
         <button class="ctrl-btn" onclick="seek(30)"  title="Fwd 30s (Shift+→)">30s ⏭</button>
-        <button id="btn-auto-next" class="ctrl-btn" onclick="toggleAutoNext()" title="Auto-play next file: off" aria-pressed="false">Auto next: Off</button>
+          <button id="btn-auto-next" class="ctrl-btn" onclick="toggleAutoNext()" title="Auto-advance through hotspots and into the next file: off" aria-pressed="false">Auto next hotspot: Off</button>
         <span class="spacer"></span>
         <button id="btn-mute" class="ctrl-btn" onclick="toggleMute()" title="Mute (M)">🔊</button>
         <input type="range" id="vol-track" class="vol-slider" min="0" max="1" step="0.02" value="1">
@@ -2540,23 +2884,43 @@ def generate_html(results: List[dict], args: argparse.Namespace) -> str:
     js_data = []
     for r in results:
         dur = r["duration"] or 0
+        segments = list(r.get("segments", []))
+        positive_duration = _union_duration(
+            sorted(
+                (
+                    (float(seg.get("start", 0.0)), float(seg.get("end", 0.0)))
+                    for seg in segments
+                    if float(seg.get("end", 0.0)) > float(seg.get("start", 0.0))
+                ),
+                key=lambda pair: (pair[0], pair[1]),
+            )
+        )
         js_data.append({
             "name":         r["name"],
             "url":          r["url"],
             "kind":         r.get("kind", "video"),
             "duration":     round(dur, 3),
             "duration_fmt": format_duration(r["duration"]),
+            "positive_duration": round(positive_duration, 3),
             "female_pct":   round(max(r["female_pct"], 0), 2),
             "male_pct":     round(max(r["male_pct"],   0), 2),
+            "segments":     segments,
             "hotspots":     r.get("hotspots", []),
         })
 
     data_json = json.dumps(js_data, ensure_ascii=True)
+    js = (
+        JS.replace("HAS_SECOND_METRIC", "true" if has_second_metric else "false")
+        .replace("<<<HOTSPOT_MERGE_GAP>>>", json.dumps(HOTSPOT_MERGE_GAP_SECONDS))
+        .replace("<<<HOTSPOT_PADDING>>>", json.dumps(HOTSPOT_PADDING_SECONDS))
+        .replace("<<<HOTSPOT_MIN_DURATION>>>", json.dumps(HOTSPOT_MIN_DURATION_SECONDS))
+        .replace("<<<HOTSPOT_SEEK_PREROLL>>>", json.dumps(HOTSPOT_SEEK_PREROLL_SECONDS))
+    )
 
     html = (
         HTML_TEMPLATE
         .replace("<<<CSS>>>",       CSS)
-        .replace("<<<JS>>>",        JS.replace("HAS_SECOND_METRIC", "true" if has_second_metric else "false"))
+        .replace("<<<JS>>>",        js)
         .replace("<<<DATA_JSON>>>", data_json)
         .replace("<<<FILE_COUNT>>>", str(len(results)))
         .replace("<<<SUBTITLE>>>", build_report_subtitle(len(results), args))
