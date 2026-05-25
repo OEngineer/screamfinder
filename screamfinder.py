@@ -1444,6 +1444,7 @@ function openPlayer(idx, opts = {}) {
   playerSubtitleEl.textContent = item.parent_dir || '';
   playerError.classList.add('hidden');
   playerControls.style.display = '';
+  updateAutoNextButton();
   playerWrap.classList.toggle('is-audio', isAudio);
   audioCover.classList.toggle('hidden', !isAudio);
   audioCoverName.textContent = isAudio ? item.name : '';
@@ -1498,7 +1499,6 @@ function closePlayer() {
   playerTitleEl.textContent = '';
   playerSubtitleEl.textContent = '';
   currentItemIdx = null;
-  autoNext = false;
   activeHotspots = [];
   activeHotspotIdx = -1;
   autoAdvancePendingHotspotIdx = -1;
