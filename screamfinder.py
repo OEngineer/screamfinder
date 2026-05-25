@@ -745,6 +745,12 @@ tr:hover td { background: var(--surface2); }
   color: #bcbcd6;
 }
 
+.file-nav-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
 .hotspot-settings {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -994,6 +1000,10 @@ function renderTable() {
     if (th.dataset.col === sortCol)
       th.classList.add(sortAsc ? 'sort-asc' : 'sort-desc');
   });
+
+  if (currentItemIdx !== null) {
+    syncFileButtons();
+  }
 }
 
 // Sliders
@@ -1048,6 +1058,8 @@ const hotspotSummary = document.getElementById('hotspot-summary');
 const hotspotList    = document.getElementById('hotspot-list');
 const prevHotspotBtn = document.getElementById('btn-prev-hotspot');
 const nextHotspotBtn = document.getElementById('btn-next-hotspot');
+const prevFileBtn    = document.getElementById('btn-prev-file');
+const nextFileBtn    = document.getElementById('btn-next-file');
 const hotspotMergeGapInput = document.getElementById('hotspot-merge-gap');
 const hotspotPaddingInput = document.getElementById('hotspot-padding');
 const hotspotMinDurationInput = document.getElementById('hotspot-min-duration');
@@ -1312,6 +1324,14 @@ function nextItemIndexInPlaylist() {
   return nextIdx;
 }
 
+function prevItemIndexInPlaylist() {
+  if (currentItemIdx === null) return null;
+  const pos = playlistOrder.indexOf(currentItemIdx);
+  const prevIdx = pos > 0 ? playlistOrder[pos - 1] : currentItemIdx - 1;
+  if (prevIdx === undefined || prevIdx < 0) return null;
+  return prevIdx;
+}
+
 function prevHotspotIndex() {
   if (activeHotspots.length === 0) return -1;
   const time = video.currentTime || 0;
@@ -1339,6 +1359,11 @@ function hasNextHotspotJump() {
   return nextItemIndexInPlaylist() !== null;
 }
 
+function syncFileButtons() {
+  prevFileBtn.disabled = prevItemIndexInPlaylist() === null;
+  nextFileBtn.disabled = nextItemIndexInPlaylist() === null;
+}
+
 function jumpToHotspot(idx) {
   if (idx < 0 || idx >= activeHotspots.length || !video.duration) return;
   const hotspot = activeHotspots[idx];
@@ -1359,6 +1384,12 @@ function firstHotspotSeekForItem(idx) {
 function jumpPrevHotspot() {
   const idx = prevHotspotIndex();
   if (idx >= 0) jumpToHotspot(idx);
+}
+
+function jumpPrevFile() {
+  const prevIdx = prevItemIndexInPlaylist();
+  if (prevIdx === null) return;
+  openPlayer(prevIdx, { seekTime: firstHotspotSeekForItem(prevIdx) ?? 0 });
 }
 
 function jumpNextHotspot() {
@@ -1453,6 +1484,7 @@ function openPlayer(idx, opts = {}) {
   updateAirPlayButton();
   video.src = item.url;
   renderHotspots(item.hotspots || []);
+  syncFileButtons();
   modal.classList.remove('hidden');
   document.body.style.overflow = 'hidden';
   showControls();
@@ -1508,6 +1540,7 @@ function closePlayer() {
   hotspotList.innerHTML = '';
   hotspotPanel.classList.add('hidden');
   hotspotSummary.textContent = '';
+  syncFileButtons();
   updateAirPlayButton();
   updateAutoNextButton();
   clearTimeout(hideCtrlTimer);
@@ -1899,6 +1932,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
         <div class="hotspot-settings-note">Live changes only affect this report view and use the detected segments already embedded in it.</div>
         <div id="hotspot-list" class="hotspot-list"></div>
+      </div>
+      <div class="file-nav-row">
+        <button id="btn-prev-file" class="ctrl-btn" onclick="jumpPrevFile()" title="Previous file">← file</button>
+        <button id="btn-next-file" class="ctrl-btn" onclick="playNextInSequence()" title="Next file">file →</button>
       </div>
       <div class="ctrl-row">
         <button id="btn-play" class="ctrl-btn" onclick="togglePlay()" title="Play/Pause (Space)">▶</button>
