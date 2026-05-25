@@ -51,9 +51,12 @@ segments_json = ""
 
 # YAMNet configuration (used only when detector = "yamnet")
 yamnet_model = "https://tfhub.dev/google/yamnet/1"
-yamnet_score_threshold = 0.35
+yamnet_score_threshold = 0.05
 yamnet_label_debug_json = ""
 yamnet_top_k = 8
+yamnet_min_window_rms = 0.005
+yamnet_context_rms_seconds = 12.0
+yamnet_context_rms_ratio = 0.0
 
 # Set to true to disable caching entirely
 no_cache = false

@@ -144,9 +144,12 @@ python3 screamfinder.py [options] PATH [PATH ...]
 |---|---|---|
 | `--detector NAME` | `heuristic` | Detection backend. `heuristic` is the current streaming STFT detector and is the integration point future model-based detectors will share. |
 | `--yamnet-model HANDLE` | `https://tfhub.dev/google/yamnet/1` | TensorFlow Hub handle or local SavedModel path used when `--detector yamnet` is selected |
-| `--yamnet-score-threshold N` | `0.35` | Threshold for YAMNet scream/moan segment activation |
-| `--yamnet-label-debug-json FILE` | off | Optional JSON export with per-window YAMNet scream/moan scores and top AudioSet labels |
+| `--yamnet-score-threshold N` | `0.05` | Threshold for YAMNet weighted sex-vocalization segment activation |
+| `--yamnet-label-debug-json FILE` | off | Optional JSON export with per-window YAMNet vocalization scores and top AudioSet labels |
 | `--yamnet-top-k N` | `8` | Number of top AudioSet labels to store per window in the YAMNet debug export |
+| `--yamnet-min-window-rms RMS` | `0.005` | Absolute RMS backstop for YAMNet windows before scoring |
+| `--yamnet-context-rms-seconds SEC` | `12.0` | Amount of preceding audio context used by the adaptive YAMNet energy gate |
+| `--yamnet-context-rms-ratio RATIO` | `0.0` | Require each YAMNet window to be at least this fraction of the recent context RMS reference |
 | `-t N`, `--threshold N` | `4.0` | A frame is counted as vocal when its band energy exceeds this multiple of the per-band noise floor. Raise to reduce false positives; lower to catch quieter vocalizations. |
 | `--female-freq LOW HIGH` | `500 2000` | Female vocalization frequency range (Hz) |
 | `--male-freq LOW HIGH` | `80 200` | Male vocalization frequency range (Hz) |
@@ -201,9 +204,12 @@ cache = ".screamfinder-cache.json"
 detector = "heuristic"
 segments_json = ""
 yamnet_model = "https://tfhub.dev/google/yamnet/1"
-yamnet_score_threshold = 0.35
+yamnet_score_threshold = 0.05
 yamnet_label_debug_json = ""
 yamnet_top_k = 8
+yamnet_min_window_rms = 0.005
+yamnet_context_rms_seconds = 12.0
+yamnet_context_rms_ratio = 0.0
 
 min_audio_rms   = 0.005
 noise_floor_pct = 10.0
@@ -236,18 +242,26 @@ Directories are searched recursively. Any format ffmpeg can decode will work for
 
 ### YAMNet detector
 
-When `--detector yamnet` is selected, ScreamFinder decodes audio at `16000 Hz` and runs Google's YAMNet AudioSet classifier over streaming chunks. The report columns are relabeled to `Scream %` and `Moan %`, and the JSON export labels segments as `scream` or `moan`.
+When `--detector yamnet` is selected, ScreamFinder decodes audio at `16000 Hz` and runs Google's YAMNet AudioSet classifier over streaming chunks. It combines scream, moan, crying, and whimper-style evidence into a single weighted `Vocal %` metric for sex-vocalization detection, and the JSON export labels positive segments as `vocalization`.
+
+Before scoring each YAMNet window, ScreamFinder applies an adaptive RMS energy gate. A window must clear:
+
+- the absolute backstop `--yamnet-min-window-rms`
+- and, when enabled, a relative threshold based on the preceding `--yamnet-context-rms-seconds` of audio
+
+This helps suppress near-silent or very weak windows without forcing the same fixed RMS floor on every file. The adaptive part is optional and is disabled by default when `--yamnet-context-rms-ratio` is `0.0`.
 
 ### YAMNet label debug export
 
 If `--yamnet-label-debug-json debug.json` is provided, ScreamFinder writes one entry per YAMNet analysis window with:
 
 - `start` and `end`
-- computed `scream_score`
-- computed `moan_score`
+- `audio_rms` and `audio_rms_threshold`
+- `energy_gated`
+- computed `vocalization_score`
 - `top_labels`, containing the highest-scoring raw AudioSet labels for that window
 
-This export is meant for tuning the scream/moan weight maps and threshold against your real samples.
+This export is meant for tuning the combined vocalization weight map and threshold against your real samples.
 
 ### Sample annotation format
 

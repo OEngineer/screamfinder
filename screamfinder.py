@@ -63,26 +63,44 @@ YAMNET_PATCH_WINDOW_SECONDS = 0.96
 YAMNET_PATCH_HOP_SECONDS = 0.48
 YAMNET_CHUNK_SECONDS = 30.0
 YAMNET_CHUNK_OVERLAP_SECONDS = 1.0
-YAMNET_SCREAM_WEIGHTS = {
+YAMNET_MIN_WINDOW_RMS = 0.005
+YAMNET_CONTEXT_RMS_SECONDS = 12.0
+YAMNET_CONTEXT_RMS_RATIO = 0.0
+YAMNET_CONTEXT_RMS_PERCENTILE = 75.0
+YAMNET_VOCALIZATION_WEIGHTS = {
     "Screaming": 1.00,
-    "Yell": 0.75,
-    "Shout": 0.70,
-    "Whoop": 0.25,
-}
-YAMNET_MOAN_WEIGHTS = {
-    "Wail, moan": 1.00,
+    "Wail, moan": 0.95,
     "Groan": 0.90,
-    "Crying, sobbing": 0.55,
-    "Gasp": 0.45,
-    "Pant": 0.35,
-    "Whimper": 0.35,
+    "Crying, sobbing": 0.90,
+    "Whimper": 0.80,
+    "Baby cry, infant cry": 0.55,
+    "Gasp": 0.35,
+    "Breathing": 0.18,
+    "Pant": 0.20,
+    "Grunt": 0.15,
+    "Sigh": 0.10,
+    "Yell": 0.50,
+    "Shout": 0.45,
 }
 YAMNET_NEGATIVE_WEIGHTS = {
-    "Speech": 0.35,
-    "Conversation": 0.40,
-    "Narration, monologue": 0.40,
-    "Music": 0.70,
-    "Background music": 0.80,
+    "Speech": 0.20,
+    "Conversation": 0.25,
+    "Narration, monologue": 0.30,
+    "Music": 1.00,
+    "Background music": 1.10,
+    "Whoop": 0.60,
+    "Bellow": 0.70,
+    "Crowd": 0.75,
+    "Cheering": 0.75,
+    "Children shouting": 0.60,
+    "Hubbub, speech noise, speech babble": 0.60,
+    "Dog": 0.55,
+    "Domestic animals, pets": 0.45,
+    "Animal": 0.30,
+    "Whimper (dog)": 0.65,
+    "Yip": 0.55,
+    "Bow-wow": 0.55,
+    "Howl": 0.50,
 }
 
 
@@ -91,19 +109,30 @@ def media_kind(path: Path) -> str:
     return "audio" if path.suffix.lower() in AUDIO_EXTENSIONS else "video"
 
 
-def detector_metric_labels(detector: str) -> Tuple[str, str]:
+def detector_metric_labels(detector: str) -> Tuple[str, Optional[str]]:
     if detector == "yamnet":
-        return "Scream %", "Moan %"
+        return "Vocal %", None
     return "Female %", "Male %"
 
 
 def build_report_subtitle(file_count: int, args: argparse.Namespace) -> str:
     clip_info = f" &bull; Clip: last {args.clip_duration:g}s" if args.clip_duration > 0 else ""
     if args.detector == "yamnet":
+        gate_info = ""
+        if args.yamnet_context_rms_ratio > 0 and args.yamnet_min_window_rms > 0:
+            gate_info = (
+                f" &bull; Energy gate: max({args.yamnet_min_window_rms:.4f}, "
+                f"{args.yamnet_context_rms_ratio:.2f}x recent)"
+            )
+        elif args.yamnet_context_rms_ratio > 0:
+            gate_info = f" &bull; Energy gate: {args.yamnet_context_rms_ratio:.2f}x recent"
+        elif args.yamnet_min_window_rms > 0:
+            gate_info = f" &bull; Energy floor: {args.yamnet_min_window_rms:.4f} RMS"
         return (
             f"{file_count} file(s) &bull; Detector: YAMNet &bull; "
             f"Sample rate: {YAMNET_SAMPLE_RATE} Hz &bull; "
-            f"Threshold: {args.yamnet_score_threshold:.2f}{clip_info}"
+            f"Vocalization threshold: {args.yamnet_score_threshold:.2f}"
+            f"{gate_info}{clip_info}"
         )
     return (
         f"{file_count} file(s) &bull; "
@@ -572,6 +601,8 @@ tr:hover td { background: var(--surface2); }
   white-space: nowrap;
 }
 
+.hidden-metric { display: none !important; }
+
 /* Cursor hiding when controls hidden and playing */
 .player-wrap.hide-cursor { cursor: none; }
 """
@@ -598,7 +629,7 @@ function getWeights() {
 function computeScore(item, w) {
   return w.dur * (item.duration / maxDuration)
        + w.fem * (item.female_pct / 100)
-       + w.mal * (item.male_pct  / 100);
+       + (HAS_SECOND_METRIC ? w.mal * (item.male_pct / 100) : 0);
 }
 
 // ── Table rendering ───────────────────────────────────────────────────────
@@ -637,6 +668,11 @@ function renderTable() {
     const malW = Math.min(item.male_pct,  100);
     const femTxt = item.female_pct >= 0 ? item.female_pct.toFixed(1) + '%' : '—';
     const malTxt = item.male_pct   >= 0 ? item.male_pct.toFixed(1)   + '%' : '—';
+    const metric2Cell = HAS_SECOND_METRIC ? `
+      <td class="bar-cell bar-m">
+        <div class="bar-fill" style="width:${malW}%"></div>
+        <span class="bar-text">${malTxt}</span>
+      </td>` : '';
 
     const icon = item.kind === 'audio' ? '\u266A' : '\u25B6';
     return `<tr>
@@ -654,10 +690,7 @@ function renderTable() {
         <div class="bar-fill" style="width:${femW}%"></div>
         <span class="bar-text">${femTxt}</span>
       </td>
-      <td class="bar-cell bar-m">
-        <div class="bar-fill" style="width:${malW}%"></div>
-        <span class="bar-text">${malTxt}</span>
-      </td>
+      ${metric2Cell}
       <td class="bar-cell bar-s">
         <div class="bar-fill" style="width:${scoreNorm.toFixed(1)}%"></div>
         <span class="bar-text">${(item.score * 100).toFixed(1)}</span>
@@ -676,6 +709,7 @@ function renderTable() {
 // Sliders
 ['w-dur','w-fem','w-mal'].forEach(id => {
   const sl = document.getElementById(id);
+  if (!sl) return;
   const vl = document.getElementById(id + '-val');
   sl.addEventListener('input', () => {
     vl.textContent = parseFloat(sl.value).toFixed(1);
@@ -1013,7 +1047,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <input type="range" id="w-fem" min="0" max="5" step="0.1" value="2.0">
       <span class="slider-val" id="w-fem-val">2.0</span>
     </div>
-    <div class="slider-group">
+    <div class="slider-group <<<METRIC2_GROUP_CLASS>>>">
       <label><span class="swatch" style="background:#2196f3"></span><<<METRIC2_LABEL>>></label>
       <input type="range" id="w-mal" min="0" max="5" step="0.1" value="1.0">
       <span class="slider-val" id="w-mal-val">1.0</span>
@@ -1029,7 +1063,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <th data-col="name">Filename</th>
         <th data-col="duration">Duration</th>
         <th data-col="female_pct"><<<METRIC1_LABEL>>></th>
-        <th data-col="male_pct"><<<METRIC2_LABEL>>></th>
+        <th data-col="male_pct" class="<<<METRIC2_COL_CLASS>>>"><<<METRIC2_LABEL>>></th>
         <th data-col="score">Score</th>
       </tr>
     </thead>
@@ -1675,10 +1709,52 @@ def _yamnet_top_labels(
     ]
 
 
+def _window_rms_envelope(
+    audio: np.ndarray,
+    window_samples: int,
+    hop_samples: int,
+) -> np.ndarray:
+    if audio.size < window_samples or window_samples <= 0 or hop_samples <= 0:
+        return np.empty(0, dtype=np.float32)
+    squared = np.square(audio.astype(np.float64, copy=False))
+    cumsum = np.empty(squared.size + 1, dtype=np.float64)
+    cumsum[0] = 0.0
+    np.cumsum(squared, out=cumsum[1:])
+    starts = np.arange(0, audio.size - window_samples + 1, hop_samples, dtype=np.int64)
+    ends = starts + window_samples
+    power = (cumsum[ends] - cumsum[starts]) / float(window_samples)
+    return np.sqrt(power).astype(np.float32)
+
+
+def _adaptive_rms_thresholds(
+    frame_rms: np.ndarray,
+    history: List[float],
+    min_window_rms: float,
+    context_frames: int,
+    context_ratio: float,
+) -> np.ndarray:
+    thresholds = np.empty(frame_rms.shape[0], dtype=np.float32)
+    for idx, rms in enumerate(frame_rms):
+        threshold = float(min_window_rms)
+        if context_ratio > 0 and history:
+            if context_frames > 0 and len(history) > context_frames:
+                context = history[-context_frames:]
+            else:
+                context = history
+            context_ref = float(np.percentile(context, YAMNET_CONTEXT_RMS_PERCENTILE))
+            threshold = max(threshold, context_ref * context_ratio)
+        thresholds[idx] = threshold
+        history.append(float(rms))
+    return thresholds
+
+
 def analyze_yamnet_streaming(
     video_path: Path,
     model_handle: str,
     score_threshold: float,
+    min_window_rms: float = YAMNET_MIN_WINDOW_RMS,
+    context_rms_seconds: float = YAMNET_CONTEXT_RMS_SECONDS,
+    context_rms_ratio: float = YAMNET_CONTEXT_RMS_RATIO,
     start_sec: float = 0.0,
     duration_sec: Optional[float] = None,
     collect_debug: bool = False,
@@ -1693,6 +1769,9 @@ def analyze_yamnet_streaming(
 
     frame_hop_sec = YAMNET_PATCH_HOP_SECONDS
     frame_span_sec = YAMNET_PATCH_WINDOW_SECONDS
+    frame_span_samples = int(round(frame_span_sec * YAMNET_SAMPLE_RATE))
+    frame_hop_samples = int(round(frame_hop_sec * YAMNET_SAMPLE_RATE))
+    context_frames = max(0, int(round(context_rms_seconds / frame_hop_sec)))
     overlap_samples = int(round(YAMNET_CHUNK_OVERLAP_SECONDS * YAMNET_SAMPLE_RATE))
     duplicate_frames = int(np.floor(YAMNET_CHUNK_OVERLAP_SECONDS / frame_hop_sec))
 
@@ -1700,8 +1779,8 @@ def analyze_yamnet_streaming(
     carry = np.empty(0, dtype=np.float32)
     first_chunk = True
     emitted_frames = 0
-    scream_scores_chunks: List[np.ndarray] = []
-    moan_scores_chunks: List[np.ndarray] = []
+    rms_history: List[float] = []
+    vocal_scores_chunks: List[np.ndarray] = []
     debug_windows: List[dict] = []
 
     for chunk in iter_audio_chunks(
@@ -1715,8 +1794,50 @@ def analyze_yamnet_streaming(
             continue
         total_samples += int(chunk.size)
         work = np.concatenate((carry, chunk)) if carry.size else chunk
-        if work.size < int(round(frame_span_sec * YAMNET_SAMPLE_RATE)):
+        if work.size < frame_span_samples:
             carry = work
+            first_chunk = False
+            continue
+
+        frame_rms = _window_rms_envelope(work, frame_span_samples, frame_hop_samples)
+        start_row = 0 if first_chunk else min(duplicate_frames, frame_rms.shape[0])
+        local_frame_rms = frame_rms[start_row:]
+        if local_frame_rms.size == 0:
+            if overlap_samples > 0 and work.size > overlap_samples:
+                carry = work[-overlap_samples:].copy()
+            else:
+                carry = work.copy()
+            first_chunk = False
+            continue
+
+        rms_thresholds = _adaptive_rms_thresholds(
+            local_frame_rms,
+            rms_history,
+            min_window_rms=min_window_rms,
+            context_frames=context_frames,
+            context_ratio=context_rms_ratio,
+        )
+        energy_mask = local_frame_rms >= rms_thresholds
+        if not np.any(energy_mask):
+            vocal_scores_chunks.append(np.zeros(local_frame_rms.shape[0], dtype=np.float32))
+            if collect_debug:
+                for local_idx, audio_rms in enumerate(local_frame_rms):
+                    frame_idx = emitted_frames + local_idx
+                    win_start = start_sec + frame_idx * frame_hop_sec
+                    debug_windows.append({
+                        "start": round(win_start, 3),
+                        "end": round(win_start + frame_span_sec, 3),
+                        "audio_rms": round(float(audio_rms), 6),
+                        "audio_rms_threshold": round(float(rms_thresholds[local_idx]), 6),
+                        "energy_gated": True,
+                        "vocalization_score": 0.0,
+                        "top_labels": [],
+                    })
+            emitted_frames += local_frame_rms.shape[0]
+            if overlap_samples > 0 and work.size > overlap_samples:
+                carry = work[-overlap_samples:].copy()
+            else:
+                carry = work.copy()
             first_chunk = False
             continue
 
@@ -1726,32 +1847,39 @@ def analyze_yamnet_streaming(
         start_row = 0 if first_chunk else min(duplicate_frames, frame_scores.shape[0])
         if start_row < frame_scores.shape[0]:
             chunk_frame_scores = frame_scores[start_row:]
-            scream_chunk_scores = _yamnet_weighted_score(
+            row_count = min(chunk_frame_scores.shape[0], local_frame_rms.shape[0])
+            chunk_frame_scores = chunk_frame_scores[:row_count]
+            local_frame_rms = local_frame_rms[:row_count]
+            rms_thresholds = rms_thresholds[:row_count]
+            energy_mask = energy_mask[:row_count]
+            vocal_chunk_scores = _yamnet_weighted_score(
                 chunk_frame_scores,
                 class_index,
-                YAMNET_SCREAM_WEIGHTS,
+                YAMNET_VOCALIZATION_WEIGHTS,
                 YAMNET_NEGATIVE_WEIGHTS,
             )
-            moan_chunk_scores = _yamnet_weighted_score(
-                chunk_frame_scores,
-                class_index,
-                YAMNET_MOAN_WEIGHTS,
-                YAMNET_NEGATIVE_WEIGHTS,
-            )
-            scream_scores_chunks.append(scream_chunk_scores)
-            moan_scores_chunks.append(moan_chunk_scores)
+            if min_window_rms > 0:
+                vocal_chunk_scores = np.where(
+                    energy_mask,
+                    vocal_chunk_scores,
+                    np.zeros_like(vocal_chunk_scores),
+                )
+            vocal_scores_chunks.append(vocal_chunk_scores)
             if collect_debug:
                 for local_idx, row_scores in enumerate(chunk_frame_scores):
                     frame_idx = emitted_frames + local_idx
                     win_start = start_sec + frame_idx * frame_hop_sec
+                    energy_gated = bool(not energy_mask[local_idx])
                     debug_windows.append({
                         "start": round(win_start, 3),
                         "end": round(win_start + frame_span_sec, 3),
-                        "scream_score": round(float(scream_chunk_scores[local_idx]), 4),
-                        "moan_score": round(float(moan_chunk_scores[local_idx]), 4),
-                        "top_labels": _yamnet_top_labels(row_scores, class_names, top_k),
+                        "audio_rms": round(float(local_frame_rms[local_idx]), 6),
+                        "audio_rms_threshold": round(float(rms_thresholds[local_idx]), 6),
+                        "energy_gated": energy_gated,
+                        "vocalization_score": round(float(vocal_chunk_scores[local_idx]), 4),
+                        "top_labels": [] if energy_gated else _yamnet_top_labels(row_scores, class_names, top_k),
                     })
-                emitted_frames += chunk_frame_scores.shape[0]
+            emitted_frames += chunk_frame_scores.shape[0]
 
         if overlap_samples > 0 and work.size > overlap_samples:
             carry = work[-overlap_samples:].copy()
@@ -1760,24 +1888,13 @@ def analyze_yamnet_streaming(
         first_chunk = False
 
     analyzed_duration = total_samples / YAMNET_SAMPLE_RATE if total_samples > 0 else 0.0
-    scream_scores = (
-        np.concatenate(scream_scores_chunks) if scream_scores_chunks else np.empty(0, dtype=np.float32)
-    )
-    moan_scores = (
-        np.concatenate(moan_scores_chunks) if moan_scores_chunks else np.empty(0, dtype=np.float32)
+    vocal_scores = (
+        np.concatenate(vocal_scores_chunks) if vocal_scores_chunks else np.empty(0, dtype=np.float32)
     )
 
-    scream_pct, scream_segments = _segments_from_scores(
-        scream_scores,
-        "scream",
-        score_threshold,
-        frame_hop_sec,
-        frame_span_sec,
-        start_sec,
-    )
-    moan_pct, moan_segments = _segments_from_scores(
-        moan_scores,
-        "moan",
+    vocal_pct, vocal_segments = _segments_from_scores(
+        vocal_scores,
+        "vocalization",
         score_threshold,
         frame_hop_sec,
         frame_span_sec,
@@ -1786,14 +1903,17 @@ def analyze_yamnet_streaming(
 
     return {
         "duration": analyzed_duration,
-        "female_pct": scream_pct,
-        "male_pct": moan_pct,
-        "segments": scream_segments + moan_segments,
+        "female_pct": vocal_pct,
+        "male_pct": 0.0,
+        "segments": vocal_segments,
         "detector": "yamnet",
         "yamnet_debug": {
             "frame_hop_sec": frame_hop_sec,
             "frame_span_sec": frame_span_sec,
             "score_threshold": score_threshold,
+            "min_window_rms": min_window_rms,
+            "context_rms_seconds": context_rms_seconds,
+            "context_rms_ratio": context_rms_ratio,
             "windows": debug_windows,
         } if collect_debug else None,
     }
@@ -1814,7 +1934,10 @@ def analyze_media_file(
     start_sec: float = 0.0,
     duration_sec: Optional[float] = None,
     yamnet_model: str = "https://tfhub.dev/google/yamnet/1",
-    yamnet_score_threshold: float = 0.35,
+    yamnet_score_threshold: float = 0.05,
+    yamnet_min_window_rms: float = YAMNET_MIN_WINDOW_RMS,
+    yamnet_context_rms_seconds: float = YAMNET_CONTEXT_RMS_SECONDS,
+    yamnet_context_rms_ratio: float = YAMNET_CONTEXT_RMS_RATIO,
     yamnet_collect_debug: bool = False,
     yamnet_top_k: int = 8,
 ) -> Dict[str, object]:
@@ -1839,6 +1962,9 @@ def analyze_media_file(
             video_path,
             model_handle=yamnet_model,
             score_threshold=yamnet_score_threshold,
+            min_window_rms=yamnet_min_window_rms,
+            context_rms_seconds=yamnet_context_rms_seconds,
+            context_rms_ratio=yamnet_context_rms_ratio,
             start_sec=start_sec,
             duration_sec=duration_sec,
             collect_debug=yamnet_collect_debug,
@@ -1859,7 +1985,7 @@ def export_segments_json(results: List[dict], output_path: Path) -> None:
                 "female_pct": round(float(max(r.get("female_pct", -1.0), 0.0)), 3),
                 "male_pct": round(float(max(r.get("male_pct", -1.0), 0.0)), 3),
                 "detector": r.get("detector", "heuristic"),
-                "metric_labels": list(detector_metric_labels(str(r.get("detector", "heuristic")))),
+                "metric_labels": [label for label in detector_metric_labels(str(r.get("detector", "heuristic"))) if label],
                 "segments": r.get("segments", []),
             }
             for r in results
@@ -1878,7 +2004,7 @@ def export_yamnet_debug_json(results: List[dict], output_path: Path) -> None:
                 "kind": r["kind"],
                 "duration": round(float(r["duration"] or 0.0), 3),
                 "detector": r.get("detector", "heuristic"),
-                "metric_labels": list(detector_metric_labels(str(r.get("detector", "heuristic")))),
+                "metric_labels": [label for label in detector_metric_labels(str(r.get("detector", "heuristic"))) if label],
                 "yamnet_debug": r.get("yamnet_debug"),
             }
             for r in results
@@ -1956,6 +2082,9 @@ def _analyze_worker(video_path_str: str, params: Dict[str, object]) -> Dict[str,
     detector        = str(params["detector"])        # type: ignore[arg-type]
     yamnet_model    = str(params["yamnet_model"])    # type: ignore[arg-type]
     yamnet_score_threshold = float(params["yamnet_score_threshold"])  # type: ignore[arg-type]
+    yamnet_min_window_rms = float(params["yamnet_min_window_rms"])  # type: ignore[arg-type]
+    yamnet_context_rms_seconds = float(params["yamnet_context_rms_seconds"])  # type: ignore[arg-type]
+    yamnet_context_rms_ratio = float(params["yamnet_context_rms_ratio"])  # type: ignore[arg-type]
     yamnet_collect_debug = bool(params["yamnet_collect_debug"])  # type: ignore[arg-type]
     yamnet_top_k = int(params["yamnet_top_k"])  # type: ignore[arg-type]
 
@@ -1989,6 +2118,9 @@ def _analyze_worker(video_path_str: str, params: Dict[str, object]) -> Dict[str,
             duration_sec=extract_dur,
             yamnet_model=yamnet_model,
             yamnet_score_threshold=yamnet_score_threshold,
+            yamnet_min_window_rms=yamnet_min_window_rms,
+            yamnet_context_rms_seconds=yamnet_context_rms_seconds,
+            yamnet_context_rms_ratio=yamnet_context_rms_ratio,
             yamnet_collect_debug=yamnet_collect_debug,
             yamnet_top_k=yamnet_top_k,
         )
@@ -2036,6 +2168,7 @@ def _make_result(video_path: Path, data: Dict[str, object], cached: bool) -> dic
 def generate_html(results: List[dict], args: argparse.Namespace) -> str:
     max_duration = max((r["duration"] or 0 for r in results), default=1.0) or 1.0
     metric1_label, metric2_label = detector_metric_labels(args.detector)
+    has_second_metric = metric2_label is not None
 
     js_data = []
     for r in results:
@@ -2055,12 +2188,14 @@ def generate_html(results: List[dict], args: argparse.Namespace) -> str:
     html = (
         HTML_TEMPLATE
         .replace("<<<CSS>>>",       CSS)
-        .replace("<<<JS>>>",        JS)
+        .replace("<<<JS>>>",        JS.replace("HAS_SECOND_METRIC", "true" if has_second_metric else "false"))
         .replace("<<<DATA_JSON>>>", data_json)
         .replace("<<<FILE_COUNT>>>", str(len(results)))
         .replace("<<<SUBTITLE>>>", build_report_subtitle(len(results), args))
         .replace("<<<METRIC1_LABEL>>>", metric1_label)
-        .replace("<<<METRIC2_LABEL>>>", metric2_label)
+        .replace("<<<METRIC2_LABEL>>>", metric2_label or "")
+        .replace("<<<METRIC2_GROUP_CLASS>>>", "" if has_second_metric else "hidden-metric")
+        .replace("<<<METRIC2_COL_CLASS>>>", "" if has_second_metric else "hidden-metric")
     )
     return html
 
@@ -2106,6 +2241,9 @@ def load_config(config_path: Path) -> Dict[str, object]:
         "min_audio_rms",
         "noise_floor_pct",
         "yamnet_score_threshold",
+        "yamnet_min_window_rms",
+        "yamnet_context_rms_seconds",
+        "yamnet_context_rms_ratio",
     )
     int_keys   = ("sample_rate", "jobs", "n_fft", "hop_length", "yamnet_top_k")
     bool_keys  = ("no_cache", "force")
@@ -2193,7 +2331,7 @@ def main() -> None:
         help="TensorFlow Hub handle or local SavedModel path for YAMNet when --detector yamnet is used",
     )
     parser.add_argument(
-        "--yamnet-score-threshold", type=float, default=0.35, metavar="N",
+        "--yamnet-score-threshold", type=float, default=0.05, metavar="N",
         help="Segment activation threshold for YAMNet weighted scream/moan scores",
     )
     parser.add_argument(
@@ -2203,6 +2341,18 @@ def main() -> None:
     parser.add_argument(
         "--yamnet-top-k", type=int, default=8, metavar="N",
         help="How many top AudioSet labels to include per window in --yamnet-label-debug-json",
+    )
+    parser.add_argument(
+        "--yamnet-min-window-rms", type=float, default=YAMNET_MIN_WINDOW_RMS, metavar="RMS",
+        help="Absolute backstop RMS floor for YAMNet windows before scoring (0 = disable fixed floor)",
+    )
+    parser.add_argument(
+        "--yamnet-context-rms-seconds", type=float, default=YAMNET_CONTEXT_RMS_SECONDS, metavar="SEC",
+        help="How much preceding audio context to use for the adaptive YAMNet RMS gate",
+    )
+    parser.add_argument(
+        "--yamnet-context-rms-ratio", type=float, default=YAMNET_CONTEXT_RMS_RATIO, metavar="RATIO",
+        help="Adaptive YAMNet gate: require window RMS >= RATIO x preceding-context RMS reference",
     )
     parser.add_argument(
         "-t", "--threshold", type=float, default=3.0, metavar="N",
@@ -2331,6 +2481,9 @@ def main() -> None:
         "detector":           args.detector,
         "yamnet_model":       args.yamnet_model,
         "yamnet_score_threshold": args.yamnet_score_threshold,
+        "yamnet_min_window_rms": args.yamnet_min_window_rms,
+        "yamnet_context_rms_seconds": args.yamnet_context_rms_seconds,
+        "yamnet_context_rms_ratio": args.yamnet_context_rms_ratio,
         "yamnet_collect_debug": bool(args.yamnet_label_debug_json),
         "yamnet_top_k":       args.yamnet_top_k,
     }
@@ -2346,16 +2499,19 @@ def main() -> None:
         completed += 1
         metric1_label, metric2_label = detector_metric_labels(str(data.get("detector", args.detector)))
         metric1_name = metric1_label.replace(" %", "").lower()
-        metric2_name = metric2_label.replace(" %", "").lower()
         tag     = " (cached)" if cached else ""
         dur_str = format_duration(data.get("duration"))  # type: ignore[arg-type]
         fem     = data.get("female_pct", -1.0)
         mal     = data.get("male_pct",   -1.0)
         fem_str = f"{fem:.1f}%" if float(fem) >= 0 else "ERROR"  # type: ignore[arg-type]
         mal_str = f"{mal:.1f}%" if float(mal) >= 0 else "ERROR"  # type: ignore[arg-type]
+        metric_txt = f"{metric1_name}={fem_str}"
+        if metric2_label is not None:
+            metric2_name = metric2_label.replace(" %", "").lower()
+            metric_txt += f"  {metric2_name}={mal_str}"
         print(
             f"[{completed}/{n_total}] {name}{tag}: "
-            f"dur={dur_str}  {metric1_name}={fem_str}  {metric2_name}={mal_str}",
+            f"dur={dur_str}  {metric_txt}",
             file=sys.stderr,
         )
 
