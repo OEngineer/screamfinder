@@ -67,6 +67,10 @@ YAMNET_MIN_WINDOW_RMS = 0.005
 YAMNET_CONTEXT_RMS_SECONDS = 12.0
 YAMNET_CONTEXT_RMS_RATIO = 0.0
 YAMNET_CONTEXT_RMS_PERCENTILE = 75.0
+HOTSPOT_MERGE_GAP_SECONDS = 12.0
+HOTSPOT_PADDING_SECONDS = 4.0
+HOTSPOT_MIN_DURATION_SECONDS = 12.0
+HOTSPOT_SEEK_PREROLL_SECONDS = 2.5
 YAMNET_VOCALIZATION_WEIGHTS = {
     "Screaming": 1.00,
     "Wail, moan": 0.95,
@@ -113,6 +117,118 @@ def detector_metric_labels(detector: str) -> Tuple[str, Optional[str]]:
     if detector == "yamnet":
         return "Vocal %", None
     return "Female %", "Male %"
+
+
+def _segment_strength(segment: Dict[str, object]) -> float:
+    for key in ("peak_score", "avg_score", "peak_ratio", "avg_ratio"):
+        value = segment.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    return 0.0
+
+
+def _union_duration(intervals: List[Tuple[float, float]]) -> float:
+    if not intervals:
+        return 0.0
+    total = 0.0
+    cur_start, cur_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start <= cur_end:
+            cur_end = max(cur_end, end)
+            continue
+        total += max(0.0, cur_end - cur_start)
+        cur_start, cur_end = start, end
+    total += max(0.0, cur_end - cur_start)
+    return total
+
+
+def build_hotspots(
+    segments: List[dict],
+    duration: Optional[float],
+    merge_gap: float = HOTSPOT_MERGE_GAP_SECONDS,
+    padding: float = HOTSPOT_PADDING_SECONDS,
+    min_duration: float = HOTSPOT_MIN_DURATION_SECONDS,
+    seek_preroll: float = HOTSPOT_SEEK_PREROLL_SECONDS,
+) -> List[dict]:
+    if not segments:
+        return []
+
+    max_duration = float(duration) if duration is not None and duration > 0 else None
+    ordered = sorted(
+        (
+            seg for seg in segments
+            if float(seg.get("end", 0.0)) > float(seg.get("start", 0.0))
+        ),
+        key=lambda seg: (float(seg["start"]), float(seg["end"])),
+    )
+    if not ordered:
+        return []
+
+    clusters: List[List[dict]] = []
+    current: List[dict] = [ordered[0]]
+    current_end = float(ordered[0]["end"])
+    for seg in ordered[1:]:
+        seg_start = float(seg["start"])
+        seg_end = float(seg["end"])
+        if seg_start <= current_end + merge_gap:
+            current.append(seg)
+            current_end = max(current_end, seg_end)
+            continue
+        clusters.append(current)
+        current = [seg]
+        current_end = seg_end
+    clusters.append(current)
+
+    hotspots: List[dict] = []
+    for cluster in clusters:
+        raw_start = float(cluster[0]["start"])
+        raw_end = max(float(seg["end"]) for seg in cluster)
+        raw_span = max(0.0, raw_end - raw_start)
+        if raw_span <= 0:
+            continue
+
+        interval_pairs = sorted((float(seg["start"]), float(seg["end"])) for seg in cluster)
+        positive_duration = _union_duration(interval_pairs)
+        density = positive_duration / raw_span if raw_span > 0 else 0.0
+        peak_strength = max(_segment_strength(seg) for seg in cluster)
+        labels = sorted({str(seg.get("label", "vocalization")) for seg in cluster})
+
+        nav_start = max(0.0, raw_start - padding)
+        nav_end = raw_end + padding
+        if max_duration is not None:
+            nav_end = min(max_duration, nav_end)
+        nav_span = nav_end - nav_start
+        if nav_span < min_duration:
+            center = (raw_start + raw_end) / 2.0
+            half = min_duration / 2.0
+            nav_start = max(0.0, center - half)
+            nav_end = center + half
+            if max_duration is not None:
+                if nav_end > max_duration:
+                    nav_end = max_duration
+                    nav_start = max(0.0, nav_end - min_duration)
+                else:
+                    nav_start = max(0.0, nav_start)
+            nav_span = nav_end - nav_start
+
+        seek_to = max(0.0, raw_start - seek_preroll)
+        if max_duration is not None:
+            seek_to = min(max_duration, seek_to)
+
+        hotspots.append({
+            "start": round(nav_start, 3),
+            "end": round(nav_end, 3),
+            "seek_to": round(seek_to, 3),
+            "duration": round(max(0.0, nav_span), 3),
+            "raw_start": round(raw_start, 3),
+            "raw_end": round(raw_end, 3),
+            "positive_duration": round(positive_duration, 3),
+            "density": round(density, 4),
+            "peak_strength": round(peak_strength, 4),
+            "segment_count": len(cluster),
+            "labels": labels,
+        })
+    return hotspots
 
 
 def build_report_subtitle(file_count: int, args: argparse.Namespace) -> str:
@@ -533,12 +649,41 @@ tr:hover td { background: var(--surface2); }
 }
 .progress-track:hover { height: 7px; }
 
+.hotspot-track {
+  position: absolute;
+  inset: -4px 0;
+  pointer-events: none;
+  z-index: 3;
+}
+
+.hotspot-marker {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  min-width: 8px;
+  border: none;
+  border-radius: 999px;
+  background: rgba(255, 193, 7, 0.38);
+  box-shadow: 0 0 0 1px rgba(255, 193, 7, 0.2);
+  pointer-events: auto;
+  cursor: pointer;
+  transition: background 0.15s, box-shadow 0.15s, transform 0.15s;
+}
+
+.hotspot-marker:hover,
+.hotspot-marker.active {
+  background: rgba(255, 193, 7, 0.85);
+  box-shadow: 0 0 0 1px rgba(255, 193, 7, 0.75);
+  transform: scaleY(1.1);
+}
+
 .progress-buffered {
   position: absolute;
   top: 0; left: 0; height: 100%;
   background: rgba(255,255,255,0.25);
   border-radius: 3px;
   pointer-events: none;
+  z-index: 1;
 }
 
 .progress-fill {
@@ -547,6 +692,7 @@ tr:hover td { background: var(--surface2); }
   background: var(--pinkf);
   border-radius: 3px;
   pointer-events: none;
+  z-index: 2;
 }
 
 .progress-thumb {
@@ -558,8 +704,57 @@ tr:hover td { background: var(--surface2); }
   transform: translate(-50%, -50%) scale(0);
   pointer-events: none;
   transition: transform 0.15s;
+  z-index: 4;
 }
 .progress-track:hover .progress-thumb { transform: translate(-50%, -50%) scale(1); }
+
+.hotspot-panel {
+  margin-bottom: 10px;
+  padding: 8px 10px 9px;
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px;
+  background: rgba(255,255,255,0.04);
+}
+
+.hotspot-panel.hidden { display: none; }
+
+.hotspot-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.hotspot-summary {
+  font-size: 12px;
+  color: #bcbcd6;
+}
+
+.hotspot-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-height: 82px;
+  overflow-y: auto;
+}
+
+.hotspot-chip {
+  border: 1px solid rgba(255, 193, 7, 0.22);
+  background: rgba(255, 193, 7, 0.08);
+  color: #f7e4a0;
+  border-radius: 999px;
+  padding: 5px 9px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.hotspot-chip:hover,
+.hotspot-chip.active {
+  background: rgba(255, 193, 7, 0.2);
+  border-color: rgba(255, 193, 7, 0.55);
+  color: #fff0b3;
+}
 
 .ctrl-row {
   display: flex;
@@ -580,6 +775,10 @@ tr:hover td { background: var(--surface2); }
   flex-shrink: 0;
 }
 .ctrl-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
+.ctrl-btn:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
 .ctrl-btn.active {
   background: var(--pinkf);
   color: #fff;
@@ -740,6 +939,7 @@ const audioCover      = document.getElementById('audio-cover');
 const audioCoverName  = document.getElementById('audio-cover-name');
 const playerMedia     = document.querySelector('.player-media');
 const progressTrack  = document.getElementById('progress-track');
+const hotspotTrack   = document.getElementById('hotspot-track');
 const progressFill   = document.getElementById('progress-fill');
 const progressBuf    = document.getElementById('progress-buf');
 const progressThumb  = document.getElementById('progress-thumb');
@@ -749,12 +949,145 @@ const playBtn        = document.getElementById('btn-play');
 const autoNextBtn    = document.getElementById('btn-auto-next');
 const muteBtn        = document.getElementById('btn-mute');
 const volSlider      = document.getElementById('vol-track');
+const hotspotPanel   = document.getElementById('hotspot-panel');
+const hotspotSummary = document.getElementById('hotspot-summary');
+const hotspotList    = document.getElementById('hotspot-list');
+const prevHotspotBtn = document.getElementById('btn-prev-hotspot');
+const nextHotspotBtn = document.getElementById('btn-next-hotspot');
 
 let isDragging    = false;
 let savedVol      = 1;
 let hideCtrlTimer = null;
 let currentItemIdx = null;
 let autoNext       = false;
+let activeHotspots = [];
+let activeHotspotIdx = -1;
+
+function clamp01(n) {
+  return Math.max(0, Math.min(1, n));
+}
+
+function hotspotTitle(hotspot, idx) {
+  return `Hotspot ${idx + 1}: ${fmtTime(hotspot.raw_start ?? hotspot.start)}-${fmtTime(hotspot.raw_end ?? hotspot.end)} · ${(hotspot.density * 100).toFixed(0)}% dense`;
+}
+
+function hotspotChipText(hotspot, idx) {
+  const start = fmtTime(hotspot.raw_start ?? hotspot.start);
+  const density = `${Math.round((hotspot.density || 0) * 100)}%`;
+  return `#${idx + 1} ${start} · ${density}`;
+}
+
+function syncHotspotButtons() {
+  const hasHotspots = activeHotspots.length > 0;
+  prevHotspotBtn.disabled = !hasHotspots || prevHotspotIndex() === -1;
+  nextHotspotBtn.disabled = !hasHotspots || nextHotspotIndex() === -1;
+}
+
+function setActiveHotspot(idx) {
+  activeHotspotIdx = idx;
+  hotspotTrack.querySelectorAll('.hotspot-marker').forEach((el, markerIdx) => {
+    el.classList.toggle('active', markerIdx === idx);
+  });
+  hotspotList.querySelectorAll('.hotspot-chip').forEach((el, chipIdx) => {
+    el.classList.toggle('active', chipIdx === idx);
+  });
+  syncHotspotButtons();
+}
+
+function currentHotspotIndexForTime(time) {
+  return activeHotspots.findIndex(hotspot => time >= hotspot.start && time <= hotspot.end);
+}
+
+function prevHotspotIndex() {
+  if (activeHotspots.length === 0) return -1;
+  const time = video.currentTime || 0;
+  const containing = currentHotspotIndexForTime(time);
+  if (containing >= 0 && time > activeHotspots[containing].seek_to + 1.0) {
+    return containing;
+  }
+  for (let idx = activeHotspots.length - 1; idx >= 0; idx -= 1) {
+    if (activeHotspots[idx].seek_to < time - 0.5) return idx;
+  }
+  return -1;
+}
+
+function nextHotspotIndex() {
+  if (activeHotspots.length === 0) return -1;
+  const time = video.currentTime || 0;
+  const containing = currentHotspotIndexForTime(time);
+  const minStart = containing >= 0 ? activeHotspots[containing].end + 0.25 : time + 0.5;
+  const idx = activeHotspots.findIndex(hotspot => hotspot.seek_to >= minStart);
+  return idx;
+}
+
+function jumpToHotspot(idx) {
+  if (idx < 0 || idx >= activeHotspots.length || !video.duration) return;
+  const hotspot = activeHotspots[idx];
+  video.currentTime = Math.max(0, Math.min(video.duration, hotspot.seek_to));
+  setActiveHotspot(idx);
+  updateProgress();
+  showControls();
+}
+
+function jumpPrevHotspot() {
+  const idx = prevHotspotIndex();
+  if (idx >= 0) jumpToHotspot(idx);
+}
+
+function jumpNextHotspot() {
+  const idx = nextHotspotIndex();
+  if (idx >= 0) jumpToHotspot(idx);
+}
+
+function renderHotspots(hotspots) {
+  activeHotspots = Array.isArray(hotspots) ? hotspots.slice().sort((a, b) => a.start - b.start) : [];
+  activeHotspotIdx = -1;
+  hotspotTrack.innerHTML = '';
+  hotspotList.innerHTML = '';
+
+  if (activeHotspots.length === 0) {
+    hotspotPanel.classList.add('hidden');
+    hotspotSummary.textContent = '';
+    syncHotspotButtons();
+    return;
+  }
+
+  hotspotPanel.classList.remove('hidden');
+  hotspotSummary.textContent = `${activeHotspots.length} hotspot${activeHotspots.length === 1 ? '' : 's'} from dense positive regions`;
+
+  hotspotTrack.innerHTML = activeHotspots.map((hotspot, idx) => {
+    const left = clamp01((hotspot.start || 0) / (video.duration || hotspot.end || 1)) * 100;
+    const width = Math.max(
+      0.9,
+      (clamp01((hotspot.end || 0) / (video.duration || hotspot.end || 1)) * 100) - left,
+    );
+    return `<button type="button" class="hotspot-marker" data-hotspot-idx="${idx}" style="left:${left.toFixed(3)}%;width:${width.toFixed(3)}%" title="${esc(hotspotTitle(hotspot, idx))}"></button>`;
+  }).join('');
+
+  hotspotList.innerHTML = activeHotspots.map((hotspot, idx) =>
+    `<button type="button" class="hotspot-chip" data-hotspot-idx="${idx}" title="${esc(hotspotTitle(hotspot, idx))}">${esc(hotspotChipText(hotspot, idx))}</button>`
+  ).join('');
+
+  hotspotTrack.querySelectorAll('[data-hotspot-idx]').forEach((el) => {
+    el.addEventListener('mousedown', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+    });
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const idx = parseInt(el.dataset.hotspotIdx, 10);
+      if (!Number.isNaN(idx)) jumpToHotspot(idx);
+    });
+  });
+  hotspotList.querySelectorAll('[data-hotspot-idx]').forEach((el) => {
+    el.addEventListener('click', () => {
+      const idx = parseInt(el.dataset.hotspotIdx, 10);
+      if (!Number.isNaN(idx)) jumpToHotspot(idx);
+    });
+  });
+
+  setActiveHotspot(currentHotspotIndexForTime(video.currentTime || 0));
+}
 
 // Open / close
 function openPlayer(idx) {
@@ -768,6 +1101,7 @@ function openPlayer(idx) {
   audioCover.classList.toggle('hidden', !isAudio);
   audioCoverName.textContent = isAudio ? item.name : '';
   video.src = item.url;
+  renderHotspots(item.hotspots || []);
   modal.classList.remove('hidden');
   document.body.style.overflow = 'hidden';
   showControls();
@@ -813,6 +1147,12 @@ function closePlayer() {
   audioCoverName.textContent = '';
   currentItemIdx = null;
   autoNext = false;
+  activeHotspots = [];
+  activeHotspotIdx = -1;
+  hotspotTrack.innerHTML = '';
+  hotspotList.innerHTML = '';
+  hotspotPanel.classList.add('hidden');
+  hotspotSummary.textContent = '';
   updateAutoNextButton();
   clearTimeout(hideCtrlTimer);
 }
@@ -940,6 +1280,11 @@ function updateProgress() {
     const bp = video.buffered.end(video.buffered.length - 1) / (dur || 1);
     progressBuf.style.width = `${bp * 100}%`;
   }
+  if (activeHotspots.length > 0) {
+    setActiveHotspot(currentHotspotIndexForTime(cur));
+  } else {
+    syncHotspotButtons();
+  }
 }
 
 function seekToFraction(e) {
@@ -960,6 +1305,10 @@ document.addEventListener('mouseup',   () => { isDragging = false; });
 
 video.addEventListener('timeupdate',    updateProgress);
 video.addEventListener('durationchange', updateProgress);
+video.addEventListener('loadedmetadata', () => {
+  if (currentItemIdx !== null) renderHotspots(DATA[currentItemIdx].hotspots || []);
+  updateProgress();
+});
 video.addEventListener('ended',         () => { if (autoNext) playNextInSequence(); });
 video.addEventListener('click',         () => { togglePlay(); showControls(); });
 video.addEventListener('dblclick',      reqFullscreen);
@@ -986,6 +1335,10 @@ document.addEventListener('keydown', e => {
       e.preventDefault(); seek(e.shiftKey ? -30 : -5); showControls(); break;
     case 'ArrowRight':
       e.preventDefault(); seek(e.shiftKey ?  30 :  5); showControls(); break;
+    case '[':
+      e.preventDefault(); jumpPrevHotspot(); break;
+    case ']':
+      e.preventDefault(); jumpNextHotspot(); break;
     case 'ArrowUp':
       e.preventDefault();
       video.volume = Math.min(1, video.volume + 0.1);
@@ -1101,11 +1454,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="progress-area">
         <span id="time-cur" class="time-txt">0:00</span>
         <div id="progress-track" class="progress-track">
+          <div id="hotspot-track" class="hotspot-track"></div>
           <div id="progress-buf"   class="progress-buffered" style="width:0%"></div>
           <div id="progress-fill"  class="progress-fill"     style="width:0%"></div>
           <div id="progress-thumb" class="progress-thumb"    style="left:0%"></div>
         </div>
         <span id="time-tot" class="time-txt" style="text-align:right">0:00</span>
+      </div>
+      <div id="hotspot-panel" class="hotspot-panel hidden">
+        <div class="hotspot-toolbar">
+          <span id="hotspot-summary" class="hotspot-summary"></span>
+          <span class="spacer"></span>
+          <button id="btn-prev-hotspot" class="ctrl-btn" onclick="jumpPrevHotspot()" title="Previous hotspot ([)">← hotspot</button>
+          <button id="btn-next-hotspot" class="ctrl-btn" onclick="jumpNextHotspot()" title="Next hotspot (])">hotspot →</button>
+        </div>
+        <div id="hotspot-list" class="hotspot-list"></div>
       </div>
       <div class="ctrl-row">
         <button id="btn-play" class="ctrl-btn" onclick="togglePlay()" title="Play/Pause (Space)">▶</button>
@@ -1120,7 +1483,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <button class="ctrl-btn" onclick="reqFullscreen()" title="Fullscreen (F)">⛶</button>
       </div>
       <div style="margin-top:6px">
-        <span class="kbd-hint">Keys: Space play/pause &bull; ←→ ±5s &bull; Shift+←→ ±30s &bull; ↑↓ volume &bull; M mute &bull; F fullscreen &bull; 0–9 jump &bull; Esc close</span>
+        <span class="kbd-hint">Keys: Space play/pause &bull; ←→ ±5s &bull; Shift+←→ ±30s &bull; [] hotspots &bull; ↑↓ volume &bull; M mute &bull; F fullscreen &bull; 0–9 jump &bull; Esc close</span>
       </div>
     </div>
   </div>
@@ -1987,6 +2350,7 @@ def export_segments_json(results: List[dict], output_path: Path) -> None:
                 "detector": r.get("detector", "heuristic"),
                 "metric_labels": [label for label in detector_metric_labels(str(r.get("detector", "heuristic"))) if label],
                 "segments": r.get("segments", []),
+                "hotspots": r.get("hotspots", []),
             }
             for r in results
         ],
@@ -2146,15 +2510,18 @@ def _analyze_worker(video_path_str: str, params: Dict[str, object]) -> Dict[str,
 
 def _make_result(video_path: Path, data: Dict[str, object], cached: bool) -> dict:
     """Build the per-file result dict from worker output."""
+    duration = data.get("duration")
+    segments = list(data.get("segments", []))  # type: ignore[arg-type]
     return {
         "path":       str(video_path),
         "url":        video_path.as_uri(),
         "name":       video_path.name,
         "kind":       media_kind(video_path),
-        "duration":   data.get("duration"),
+        "duration":   duration,
         "female_pct": data.get("female_pct", -1.0),
         "male_pct":   data.get("male_pct",   -1.0),
-        "segments":   data.get("segments", []),
+        "segments":   segments,
+        "hotspots":   build_hotspots(segments, duration if isinstance(duration, (int, float)) else None),
         "detector":   data.get("detector", "heuristic"),
         "yamnet_debug": data.get("yamnet_debug"),
         "cached":     cached,
@@ -2181,6 +2548,7 @@ def generate_html(results: List[dict], args: argparse.Namespace) -> str:
             "duration_fmt": format_duration(r["duration"]),
             "female_pct":   round(max(r["female_pct"], 0), 2),
             "male_pct":     round(max(r["male_pct"],   0), 2),
+            "hotspots":     r.get("hotspots", []),
         })
 
     data_json = json.dumps(js_data, ensure_ascii=True)
