@@ -21,6 +21,7 @@ Examples:
 import argparse
 import csv
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -58,6 +59,7 @@ AUDIO_EXTENSIONS = frozenset({
 MEDIA_EXTENSIONS = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
 STREAM_CHUNK_SECONDS = 120.0
 DETECTOR_CHOICES = ("heuristic", "yamnet")
+ANALYSIS_CACHE_VERSION = 2
 YAMNET_SAMPLE_RATE = 16000
 YAMNET_PATCH_WINDOW_SECONDS = 0.96
 YAMNET_PATCH_HOP_SECONDS = 0.48
@@ -888,13 +890,19 @@ function getWeights() {
     dur: parseFloat(document.getElementById('w-dur').value),
     fem: parseFloat(document.getElementById('w-fem').value),
     mal: parseFloat(document.getElementById('w-mal').value),
+    eng: parseFloat(document.getElementById('w-eng').value),
   };
 }
 
 function computeScore(item, w) {
-  return w.dur * ((item.positive_duration || 0) / maxPositiveDuration)
-       + w.fem * (item.female_pct / 100)
-       + (HAS_SECOND_METRIC ? w.mal * (item.male_pct / 100) : 0);
+  const energy = Math.max(0, Math.min(1, item.energy_confidence || 0));
+  const positiveTime = (item.positive_duration || 0) / maxPositiveDuration;
+  const base =
+    w.dur * positiveTime +
+    w.fem * (item.female_pct / 100) +
+    (HAS_SECOND_METRIC ? w.mal * (item.male_pct / 100) : 0);
+  const damping = 0.35 + 0.65 * energy;
+  return base * damping + w.eng * energy;
 }
 
 // ── Table rendering ───────────────────────────────────────────────────────
@@ -972,7 +980,7 @@ function renderTable() {
 }
 
 // Sliders
-['w-dur','w-fem','w-mal'].forEach(id => {
+['w-dur','w-fem','w-mal','w-eng'].forEach(id => {
   const sl = document.getElementById(id);
   if (!sl) return;
   const vl = document.getElementById(id + '-val');
@@ -1730,6 +1738,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <input type="range" id="w-mal" min="0" max="5" step="0.1" value="1.0">
       <span class="slider-val" id="w-mal-val">1.0</span>
     </div>
+    <div class="slider-group">
+      <label><span class="swatch" style="background:#5ec9a1"></span>Energy</label>
+      <input type="range" id="w-eng" min="0" max="5" step="0.1" value="2.0">
+      <span class="slider-val" id="w-eng-val">2.0</span>
+    </div>
   </div>
 </div>
 
@@ -1980,6 +1993,104 @@ def iter_audio_chunks(
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+
+
+def _rms_to_dbfs(rms: float) -> float:
+    return 20.0 * math.log10(max(rms, 1.0e-9))
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def compute_segment_energy_profile(
+    video_path: Path,
+    sample_rate: int,
+    segments: List[dict],
+    start_sec: float = 0.0,
+    duration_sec: Optional[float] = None,
+) -> Dict[str, float]:
+    """Measure positive-vs-background energy for ranked segments using a second streamed pass."""
+    intervals = sorted(
+        (
+            (float(seg.get("start", 0.0)), float(seg.get("end", 0.0)))
+            for seg in segments
+            if float(seg.get("end", 0.0)) > float(seg.get("start", 0.0))
+        ),
+        key=lambda pair: (pair[0], pair[1]),
+    )
+    if not intervals:
+        return {
+            "positive_rms": 0.0,
+            "background_rms": 0.0,
+            "positive_dbfs": -180.0,
+            "background_dbfs": -180.0,
+            "contrast_db": 0.0,
+            "energy_confidence": 0.0,
+        }
+
+    pos_sq = 0.0
+    pos_n = 0
+    bg_sq = 0.0
+    bg_n = 0
+    consumed_samples = 0
+    interval_idx = 0
+
+    for chunk in iter_audio_chunks(
+        video_path,
+        sample_rate,
+        start_sec=start_sec,
+        duration_sec=duration_sec,
+    ):
+        if chunk.size == 0:
+            continue
+
+        chunk_start = start_sec + (consumed_samples / sample_rate)
+        chunk_end = chunk_start + (chunk.size / sample_rate)
+        consumed_samples += int(chunk.size)
+
+        while interval_idx < len(intervals) and intervals[interval_idx][1] <= chunk_start:
+            interval_idx += 1
+
+        mask = np.zeros(chunk.size, dtype=bool)
+        probe_idx = interval_idx
+        while probe_idx < len(intervals):
+            seg_start, seg_end = intervals[probe_idx]
+            if seg_start >= chunk_end:
+                break
+            local_start = max(0, int(math.floor((seg_start - chunk_start) * sample_rate)))
+            local_end = min(chunk.size, int(math.ceil((seg_end - chunk_start) * sample_rate)))
+            if local_end > local_start:
+                mask[local_start:local_end] = True
+            probe_idx += 1
+
+        if np.any(mask):
+            pos_chunk = chunk[mask]
+            pos_sq += float(np.dot(pos_chunk, pos_chunk))
+            pos_n += int(pos_chunk.size)
+        if np.any(~mask):
+            bg_chunk = chunk[~mask]
+            bg_sq += float(np.dot(bg_chunk, bg_chunk))
+            bg_n += int(bg_chunk.size)
+
+    positive_rms = math.sqrt(pos_sq / pos_n) if pos_n > 0 else 0.0
+    background_rms = math.sqrt(bg_sq / bg_n) if bg_n > 0 else 0.0
+    positive_dbfs = _rms_to_dbfs(positive_rms) if positive_rms > 0 else -180.0
+    background_dbfs = _rms_to_dbfs(background_rms) if background_rms > 0 else -180.0
+    contrast_db = positive_dbfs - background_dbfs if background_rms > 0 else (18.0 if positive_rms > 0 else 0.0)
+
+    loudness_factor = _clamp01((positive_dbfs + 38.0) / 22.0)
+    contrast_factor = 1.0 if background_rms <= 0 and positive_rms > 0 else _clamp01((contrast_db - 2.0) / 12.0)
+    energy_confidence = _clamp01(0.65 * loudness_factor + 0.35 * contrast_factor)
+
+    return {
+        "positive_rms": round(positive_rms, 6),
+        "background_rms": round(background_rms, 6),
+        "positive_dbfs": round(positive_dbfs, 2),
+        "background_dbfs": round(background_dbfs, 2),
+        "contrast_db": round(contrast_db, 2),
+        "energy_confidence": round(energy_confidence, 4),
+    }
 
 
 def _filter_short_runs(vocal: np.ndarray, min_frames: int) -> np.ndarray:
@@ -2844,11 +2955,36 @@ def _analyze_worker(video_path_str: str, params: Dict[str, object]) -> Dict[str,
             "segments": [],
             "detector": detector,
             "yamnet_debug": None,
+            "positive_rms": 0.0,
+            "background_rms": 0.0,
+            "positive_dbfs": -180.0,
+            "background_dbfs": -180.0,
+            "contrast_db": 0.0,
+            "energy_confidence": 0.0,
         }
 
     # Use ffprobe-reported full duration when clipping; otherwise derive from analyzed audio.
     duration = reported_duration if reported_duration is not None else float(analysis["duration"])
     analysis["duration"] = duration
+    try:
+        analysis.update(
+            compute_segment_energy_profile(
+                video_path,
+                sample_rate,
+                list(analysis.get("segments", [])),  # type: ignore[arg-type]
+                start_sec=start_sec,
+                duration_sec=extract_dur,
+            )
+        )
+    except Exception:
+        analysis.update({
+            "positive_rms": 0.0,
+            "background_rms": 0.0,
+            "positive_dbfs": -180.0,
+            "background_dbfs": -180.0,
+            "contrast_db": 0.0,
+            "energy_confidence": 0.0,
+        })
     return analysis
 
 
@@ -2864,6 +3000,10 @@ def _make_result(video_path: Path, data: Dict[str, object], cached: bool) -> dic
         "duration":   duration,
         "female_pct": data.get("female_pct", -1.0),
         "male_pct":   data.get("male_pct",   -1.0),
+        "energy_confidence": data.get("energy_confidence", 0.0),
+        "positive_dbfs": data.get("positive_dbfs", -180.0),
+        "background_dbfs": data.get("background_dbfs", -180.0),
+        "contrast_db": data.get("contrast_db", 0.0),
         "segments":   segments,
         "hotspots":   build_hotspots(segments, duration if isinstance(duration, (int, float)) else None),
         "detector":   data.get("detector", "heuristic"),
@@ -2904,6 +3044,10 @@ def generate_html(results: List[dict], args: argparse.Namespace) -> str:
             "positive_duration": round(positive_duration, 3),
             "female_pct":   round(max(r["female_pct"], 0), 2),
             "male_pct":     round(max(r["male_pct"],   0), 2),
+            "energy_confidence": round(float(max(min(r.get("energy_confidence", 0.0), 1.0), 0.0)), 4),
+            "positive_dbfs": round(float(r.get("positive_dbfs", -180.0)), 2),
+            "background_dbfs": round(float(r.get("background_dbfs", -180.0)), 2),
+            "contrast_db": round(float(r.get("contrast_db", 0.0)), 2),
             "segments":     segments,
             "hotspots":     r.get("hotspots", []),
         })
@@ -3199,6 +3343,7 @@ def main() -> None:
 
     # Build analysis params dict (also used as the cache key component)
     params: Dict[str, object] = {
+        "analysis_cache_version": ANALYSIS_CACHE_VERSION,
         "sample_rate":        args.sample_rate,
         "analysis_sample_rate": analysis_sample_rate,
         "n_fft":              args.n_fft,
