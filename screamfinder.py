@@ -827,6 +827,10 @@ tr:hover td { background: var(--surface2); }
   font-weight: 700;
 }
 
+.ctrl-btn.hidden {
+  display: none;
+}
+
 .vol-slider {
   width: 80px;
   accent-color: var(--pinkf);
@@ -1021,6 +1025,7 @@ const timeCurEl      = document.getElementById('time-cur');
 const timeTotEl      = document.getElementById('time-tot');
 const playBtn        = document.getElementById('btn-play');
 const autoNextBtn    = document.getElementById('btn-auto-next');
+const airplayBtn     = document.getElementById('btn-airplay');
 const muteBtn        = document.getElementById('btn-mute');
 const volSlider      = document.getElementById('vol-track');
 const hotspotPanel   = document.getElementById('hotspot-panel');
@@ -1042,6 +1047,7 @@ let activeHotspots = [];
 let activeHotspotIdx = -1;
 let autoAdvancePendingHotspotIdx = -1;
 let pendingSeekTime = null;
+let airplayAvailable = false;
 
 function clamp01(n) {
   return Math.max(0, Math.min(1, n));
@@ -1175,6 +1181,38 @@ function writeHotspotConfigToInputs() {
   hotspotPaddingInput.value = hotspotConfig.padding;
   hotspotMinDurationInput.value = hotspotConfig.minDuration;
   hotspotSeekPrerollInput.value = hotspotConfig.seekPreroll;
+}
+
+function canUseAirPlay() {
+  return typeof video.webkitShowPlaybackTargetPicker === 'function';
+}
+
+function updateAirPlayButton() {
+  const supported = canUseAirPlay();
+  const wireless = !!video.webkitCurrentPlaybackTargetIsWireless;
+  const visible = supported;
+  airplayBtn.classList.toggle('hidden', !visible);
+  airplayBtn.classList.toggle('active', wireless);
+  airplayBtn.disabled = !supported;
+  airplayBtn.setAttribute('aria-pressed', wireless ? 'true' : 'false');
+  airplayBtn.textContent = wireless ? 'AirPlay: On' : 'AirPlay';
+  airplayBtn.title = !supported
+    ? 'AirPlay is only available in Safari/WebKit browsers that support external playback'
+    : wireless
+      ? 'AirPlay playback target is active'
+      : airplayAvailable
+        ? 'Choose an AirPlay playback target'
+        : 'Open the AirPlay playback target picker';
+}
+
+function openAirPlayPicker() {
+  if (!canUseAirPlay()) return;
+  try {
+    video.webkitShowPlaybackTargetPicker();
+  } catch (_err) {
+    return;
+  }
+  showControls();
 }
 
 function setHotspotInputsDisabled(disabled) {
@@ -1384,7 +1422,9 @@ function openPlayer(idx, opts = {}) {
   const item = DATA[idx];
   const isAudio = item.kind === 'audio';
   currentItemIdx = idx;
-  pendingSeekTime = Number.isFinite(opts.seekTime) ? opts.seekTime : null;
+  const defaultSeekTime = firstHotspotSeekForItem(idx);
+  const requestedSeekTime = Number.isFinite(opts.seekTime) ? opts.seekTime : defaultSeekTime;
+  pendingSeekTime = Number.isFinite(requestedSeekTime) ? requestedSeekTime : null;
   document.getElementById('player-title').textContent = item.name;
   playerError.classList.add('hidden');
   playerControls.style.display = '';
@@ -1392,6 +1432,8 @@ function openPlayer(idx, opts = {}) {
   audioCover.classList.toggle('hidden', !isAudio);
   audioCoverName.textContent = isAudio ? item.name : '';
   item.hotspots = deriveHotspotsForItem(item);
+  airplayAvailable = false;
+  updateAirPlayButton();
   video.src = item.url;
   renderHotspots(item.hotspots || []);
   modal.classList.remove('hidden');
@@ -1443,10 +1485,12 @@ function closePlayer() {
   activeHotspotIdx = -1;
   autoAdvancePendingHotspotIdx = -1;
   pendingSeekTime = null;
+  airplayAvailable = false;
   hotspotTrack.innerHTML = '';
   hotspotList.innerHTML = '';
   hotspotPanel.classList.add('hidden');
   hotspotSummary.textContent = '';
+  updateAirPlayButton();
   updateAutoNextButton();
   clearTimeout(hideCtrlTimer);
 }
@@ -1627,7 +1671,15 @@ video.addEventListener('loadedmetadata', () => {
     video.currentTime = target;
   }
   pendingSeekTime = null;
+  updateAirPlayButton();
   updateProgress();
+});
+video.addEventListener('webkitplaybacktargetavailabilitychanged', (event) => {
+  airplayAvailable = event.availability === 'available';
+  updateAirPlayButton();
+});
+video.addEventListener('webkitcurrentplaybacktargetiswirelesschanged', () => {
+  updateAirPlayButton();
 });
 video.addEventListener('ended',         () => {
   if (!autoNext) return;
@@ -1771,7 +1823,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <button class="hdr-btn" onclick="closePlayer()" title="Close (Esc)">✕</button>
     </div>
     <div class="player-media">
-      <video id="player" preload="metadata"></video>
+      <video id="player" preload="metadata" x-webkit-airplay="allow" airplay="allow"></video>
       <div id="audio-cover" class="audio-cover hidden">
         <div class="audio-cover-icon">&#9835;</div>
         <div id="audio-cover-name" class="audio-cover-name"></div>
@@ -1835,6 +1887,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <button class="ctrl-btn" onclick="seek(30)"  title="Fwd 30s (Shift+→)">30s ⏭</button>
           <button id="btn-auto-next" class="ctrl-btn" onclick="toggleAutoNext()" title="Auto-advance through hotspots and into the next file: off" aria-pressed="false">Auto next hotspot: Off</button>
         <span class="spacer"></span>
+        <button id="btn-airplay" class="ctrl-btn hidden" onclick="openAirPlayPicker()" title="AirPlay is only available in Safari/WebKit browsers that support external playback" aria-pressed="false">AirPlay</button>
         <button id="btn-mute" class="ctrl-btn" onclick="toggleMute()" title="Mute (M)">🔊</button>
         <input type="range" id="vol-track" class="vol-slider" min="0" max="1" step="0.02" value="1">
         <button class="ctrl-btn" onclick="reqFullscreen()" title="Fullscreen (F)">⛶</button>
