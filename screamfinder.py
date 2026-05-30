@@ -20,12 +20,14 @@ Examples:
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 try:
     import tomllib  # Python 3.11+
 except ImportError:
@@ -476,13 +478,7 @@ tr:hover td { background: var(--surface2); }
 }
 
 .player-header {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 14px;
-  background: rgba(20,20,30,0.95);
-  border-bottom: 1px solid #222;
-  flex-shrink: 0;
+  display: none;
 }
 
 .player-title-wrap {
@@ -520,6 +516,15 @@ tr:hover td { background: var(--surface2); }
   flex-shrink: 0;
 }
 .hdr-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
+
+.player-close-overlay {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 12;
+  background: rgba(0,0,0,0.62);
+  backdrop-filter: blur(8px);
+}
 
 /* Video / audio viewport only — keeps the cover from overlapping the control bar */
 .player-media {
@@ -748,8 +753,12 @@ tr:hover td { background: var(--surface2); }
 .file-nav-row {
   display: flex;
   gap: 8px;
+  align-items: center;
   margin-bottom: 10px;
-  justify-content: flex-end;
+}
+
+.file-nav-row .player-title-wrap {
+  margin-right: auto;
 }
 
 .hotspot-settings {
@@ -1871,13 +1880,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div id="modal-backdrop" class="modal-backdrop"></div>
   <div id="player-wrap" class="player-wrap">
     <div class="player-header">
-      <div class="player-title-wrap">
-        <div id="player-title" class="player-title"></div>
-        <div id="player-subtitle" class="player-subtitle"></div>
-      </div>
       <button class="hdr-btn" onclick="closePlayer()" title="Close (Esc)">✕</button>
     </div>
     <div class="player-media">
+      <button class="hdr-btn player-close-overlay" onclick="closePlayer()" title="Close (Esc)">✕</button>
       <video id="player" preload="metadata" x-webkit-airplay="allow" airplay="allow"></video>
       <div id="audio-cover" class="audio-cover hidden">
         <div class="audio-cover-icon">&#9835;</div>
@@ -1914,6 +1920,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <button id="btn-next-hotspot" class="ctrl-btn" onclick="jumpNextHotspot()" title="Next hotspot (])">hotspot →</button>
         </div>
         <div class="file-nav-row">
+          <div class="player-title-wrap">
+            <div id="player-title" class="player-title"></div>
+            <div id="player-subtitle" class="player-subtitle"></div>
+          </div>
           <button id="btn-prev-file" class="ctrl-btn" onclick="jumpPrevFile()" title="Previous file">← file</button>
           <button id="btn-next-file" class="ctrl-btn" onclick="playNextInSequence()" title="Next file">file →</button>
         </div>
@@ -2521,6 +2531,41 @@ def analyze_vocalizations_streaming(
 
 
 _YAMNET_RESOURCES: Dict[str, object] = {}
+DEFAULT_TFHUB_CACHE_DIR = Path.home() / ".cache" / "tfhub_modules"
+
+
+def _yamnet_saved_model_marker(path: Path) -> Optional[Path]:
+    for name in ("saved_model.pb", "saved_model.pbtxt"):
+        marker = path / name
+        if marker.exists():
+            return marker
+    return None
+
+
+def _yamnet_cache_candidates(model_handle: str) -> List[Path]:
+    handles = [model_handle]
+    if "tf-hub-format=" not in model_handle:
+        sep = "&" if "?" in model_handle else "?"
+        handles.append(f"{model_handle}{sep}tf-hub-format=compressed")
+
+    cache_roots: List[Path] = []
+    env_cache = os.environ.get("TFHUB_CACHE_DIR", "").strip()
+    if env_cache:
+        cache_roots.append(Path(env_cache))
+    cache_roots.append(DEFAULT_TFHUB_CACHE_DIR)
+    cache_roots.append(Path(tempfile.gettempdir()) / "tfhub_modules")
+
+    seen: set[str] = set()
+    candidates: List[Path] = []
+    for root in cache_roots:
+        for handle in handles:
+            candidate = root / hashlib.sha1(handle.encode("utf-8")).hexdigest()
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(candidate)
+    return candidates
 
 
 def _load_yamnet_resources(model_handle: str) -> Dict[str, object]:
@@ -2537,14 +2582,43 @@ def _load_yamnet_resources(model_handle: str) -> Dict[str, object]:
             "Install them before using --detector yamnet."
         ) from exc
 
+    if not os.environ.get("TFHUB_CACHE_DIR"):
+        os.environ["TFHUB_CACHE_DIR"] = str(DEFAULT_TFHUB_CACHE_DIR)
+
     try:
         model = hub.load(model_handle)
     except Exception as exc:
-        raise RuntimeError(
-            f"Could not load YAMNet model from {model_handle!r}. "
-            "Pass a local SavedModel path with --yamnet-model or make sure the model "
-            "handle is reachable."
-        ) from exc
+        valid_cache_hits: List[Path] = []
+        incomplete_cache_hits: List[Path] = []
+        for candidate in _yamnet_cache_candidates(model_handle):
+            if not candidate.exists():
+                continue
+            if _yamnet_saved_model_marker(candidate):
+                valid_cache_hits.append(candidate)
+                continue
+            incomplete_cache_hits.append(candidate)
+
+        for candidate in valid_cache_hits:
+            try:
+                model = hub.load(str(candidate))
+                break
+            except Exception:
+                continue
+        else:
+            checked = ", ".join(str(path) for path in _yamnet_cache_candidates(model_handle))
+            extra = ""
+            if incomplete_cache_hits:
+                extra = (
+                    " Found incomplete cached download(s) at: "
+                    + ", ".join(str(path) for path in incomplete_cache_hits)
+                    + "."
+                )
+            raise RuntimeError(
+                f"Could not load YAMNet model from {model_handle!r}. "
+                f"Checked TF-Hub cache paths: {checked}.{extra} "
+                f"Pass a local SavedModel path with --yamnet-model, or download the model once "
+                f"with network access so it is cached under {os.environ['TFHUB_CACHE_DIR']}."
+            ) from exc
 
     class_map_value = model.class_map_path().numpy()
     class_map_path = class_map_value.decode("utf-8") if isinstance(class_map_value, bytes) else str(class_map_value)
