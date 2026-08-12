@@ -17,7 +17,7 @@ Examples:
     python3 screamfinder.py clip1.mp4 song.mp3 --threshold 2.0
     python3 screamfinder.py ~/Media/ --female-freq 300 2500 --male-freq 80 600
     python3 screamfinder.py ~/Media/ -o report.html --serve
-    python3 screamfinder.py --serve-report report.html
+    python3 screamfinder.py --serve-report report.html --browser safari
 """
 
 import argparse
@@ -3484,11 +3484,62 @@ class _ReportHandler(BaseHTTPRequestHandler):
             return
 
 
+def open_report_url(url: str, browser: str = "default") -> None:
+    """Open a report URL in the requested browser (macOS prefers `open -a`)."""
+    browser = (browser or "default").strip().lower()
+    if browser in ("", "default", "auto"):
+        webbrowser.open(url)
+        return
+    if browser in ("none", "no", "off"):
+        return
+
+    app_names = {
+        "safari": "Safari",
+        "chrome": "Google Chrome",
+        "chromium": "Chromium",
+        "firefox": "Firefox",
+        "edge": "Microsoft Edge",
+        "brave": "Brave Browser",
+    }
+    app = app_names.get(browser, browser)
+
+    if sys.platform == "darwin":
+        try:
+            subprocess.run(["open", "-a", app, url], check=True)
+            return
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print(
+                f"WARNING: could not open {app!r} ({exc}); falling back to default browser.",
+                file=sys.stderr,
+            )
+            webbrowser.open(url)
+            return
+
+    # Non-macOS: try the named controller, then PATH binary, then default.
+    try:
+        controller = webbrowser.get(browser)
+        controller.open(url)
+        return
+    except webbrowser.Error:
+        pass
+    binary = shutil.which(browser)
+    if binary:
+        try:
+            subprocess.Popen([binary, url])  # noqa: S603
+            return
+        except OSError as exc:
+            print(
+                f"WARNING: could not launch {binary!r} ({exc}); falling back to default browser.",
+                file=sys.stderr,
+            )
+    webbrowser.open(url)
+
+
 def serve_report(
     html_path: Path,
     media_paths: Sequence[Path],
     port: int = 8765,
-    open_browser: bool = True,
+    browser: str = "default",
 ) -> None:
     """Serve a report over localhost so Safari can play media outside the report folder."""
     html_path = html_path.resolve()
@@ -3507,8 +3558,7 @@ def serve_report(
     url = f"http://127.0.0.1:{port}/"
     print(f"Serving report at {url}", file=sys.stderr)
     print("Press Ctrl+C to stop.", file=sys.stderr)
-    if open_browser:
-        webbrowser.open(url)
+    open_report_url(url, browser=browser)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -3550,6 +3600,7 @@ def load_config(config_path: Path) -> Dict[str, object]:
         "detector",
         "yamnet_model",
         "yamnet_label_debug_json",
+        "browser",
     )
     float_keys = (
         "threshold",
@@ -3647,6 +3698,11 @@ def main() -> None:
     parser.add_argument(
         "--port", type=int, default=8765, metavar="N",
         help="Port for --serve / --serve-report",
+    )
+    parser.add_argument(
+        "--browser", default="default", metavar="NAME",
+        help="Browser to open with --serve / --serve-report: default, safari, chrome, "
+             "firefox, edge, brave, or none",
     )
     parser.add_argument(
         "--segments-json", default="", metavar="FILE",
@@ -3765,7 +3821,7 @@ def main() -> None:
         except Exception as exc:
             print(f"ERROR: could not serve report: {exc}", file=sys.stderr)
             sys.exit(1)
-        serve_report(report_path, media_paths, port=args.port)
+        serve_report(report_path, media_paths, port=args.port, browser=args.browser)
         return
 
     if not args.paths:
@@ -3950,7 +4006,7 @@ def main() -> None:
 
     if args.serve:
         media_paths = [Path(r["path"]) for r in results]
-        serve_report(abs_path, media_paths, port=args.port)
+        serve_report(abs_path, media_paths, port=args.port, browser=args.browser)
 
 
 if __name__ == "__main__":

@@ -88,13 +88,13 @@ The report opens in any modern browser. Chrome can open the HTML file directly (
 
 ```bash
 # After analysis
-python3 screamfinder.py ~/Media/ -o report.html --serve
+python3 screamfinder.py ~/Media/ -o report.html --serve --browser safari
 
 # Or serve an existing report (no re-analysis)
-python3 screamfinder.py --serve-report report.html
+python3 screamfinder.py --serve-report report.html --browser safari
 ```
 
-That starts a local server at `http://127.0.0.1:8765/` (override with `--port`) and opens your browser.
+That starts a local server at `http://127.0.0.1:8765/` (override with `--port`) and opens the chosen browser (`--browser safari` if Safari isn’t your default).
 
 ---
 
@@ -147,6 +147,7 @@ python3 screamfinder.py [options] PATH [PATH ...]
 | `--serve` | off | After writing the report, serve it on localhost and open a browser (needed for Safari when media is outside the report folder) |
 | `--serve-report FILE` | off | Serve an existing HTML report on localhost (no re-analysis) |
 | `--port N` | `8765` | Port for `--serve` / `--serve-report` |
+| `--browser NAME` | `default` | Browser to open: `default`, `safari`, `chrome`, `firefox`, `edge`, `brave`, or `none` |
 | `--segments-json FILE` | off | Optional JSON export with per-file detected segments and timestamps |
 | `--config FILE` | `screamfinder.toml` | TOML config file (CLI args override) |
 | `--jobs N` | `4` | Parallel analysis workers |
