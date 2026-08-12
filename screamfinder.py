@@ -16,6 +16,8 @@ Examples:
     python3 screamfinder.py ~/Videos/ -o report.html
     python3 screamfinder.py clip1.mp4 song.mp3 --threshold 2.0
     python3 screamfinder.py ~/Media/ --female-freq 300 2500 --male-freq 80 600
+    python3 screamfinder.py ~/Media/ -o report.html --serve
+    python3 screamfinder.py --serve-report report.html
 """
 
 import argparse
@@ -23,11 +25,16 @@ import csv
 import hashlib
 import json
 import math
+import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote, urlparse
 try:
     import tomllib  # Python 3.11+
 except ImportError:
@@ -37,7 +44,7 @@ except ImportError:
         tomllib = None  # type: ignore[assignment]
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy import signal as scipy_signal
@@ -1474,6 +1481,15 @@ function renderHotspots(hotspots) {
 }
 
 // Open / close
+function mediaSrcForItem(item, idx) {
+  // Safari blocks file:// media outside the report's folder. When the report
+  // is served over localhost, stream via /media/<idx> instead.
+  if (location.protocol === 'http:' || location.protocol === 'https:') {
+    return '/media/' + idx;
+  }
+  return item.url;
+}
+
 function openPlayer(idx, opts = {}) {
   const item = DATA[idx];
   const isAudio = item.kind === 'audio';
@@ -1492,7 +1508,8 @@ function openPlayer(idx, opts = {}) {
   item.hotspots = deriveHotspotsForItem(item);
   airplayAvailable = false;
   updateAirPlayButton();
-  video.src = item.url;
+  video.src = mediaSrcForItem(item, idx);
+  video.load();
   renderHotspots(item.hotspots || []);
   syncFileButtons();
   modal.classList.remove('hidden');
@@ -1505,8 +1522,10 @@ video.addEventListener('error', () => {
   const e = video.error;
   const CODE = {1:'ABORTED', 2:'NETWORK', 3:'DECODE', 4:'SRC_NOT_SUPPORTED'};
   const detail = e ? `${CODE[e.code] || 'ERR'} (code ${e.code})${e.message ? ': ' + e.message : ''}` : 'Unknown error';
-  // Convert file:// URL back to a plain path for display
-  const rawPath = decodeURIComponent(video.src.replace(/^file:\/\//, ''));
+  const item = currentItemIdx != null ? DATA[currentItemIdx] : null;
+  // Prefer the real filesystem path; fall back to decoding a file:// URL.
+  const rawPath = (item && item.path)
+    || decodeURIComponent(video.src.replace(/^file:\/\//, ''));
   playerErrDetail.textContent = detail;
   playerErrPath.textContent = rawPath;
   playerError.classList.remove('hidden');
@@ -1884,7 +1903,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
     <div class="player-media">
       <button class="hdr-btn player-close-overlay" onclick="closePlayer()" title="Close (Esc)">✕</button>
-      <video id="player" preload="metadata" x-webkit-airplay="allow" airplay="allow"></video>
+      <video id="player" preload="metadata" playsinline webkit-playsinline x-webkit-airplay="allow" airplay="allow"></video>
       <div id="audio-cover" class="audio-cover hidden">
         <div class="audio-cover-icon">&#9835;</div>
         <div id="audio-cover-name" class="audio-cover-name"></div>
@@ -1897,7 +1916,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <button class="err-copy" onclick="copyErrPath()">Copy path</button>
       <div class="err-note">
         Paste this path into VLC, IINA, QuickTime, or any other media player.<br>
-        Browsers only support MP4/H.264, WebM, and Ogg natively.
+        Browsers only support MP4/H.264, WebM, and Ogg natively.<br>
+        Safari blocks <code>file://</code> media outside the report folder — use
+        <code>python3 screamfinder.py --serve-report &lt;this-file.html&gt;</code>.
       </div>
     </div>
     </div>
@@ -3225,6 +3246,7 @@ def generate_html(results: List[dict], args: argparse.Namespace) -> str:
         js_data.append({
             "name":         r["name"],
             "parent_dir":   parent_dir,
+            "path":         r["path"],
             "url":          r["url"],
             "kind":         r.get("kind", "video"),
             "duration":     round(dur, 3),
@@ -3262,6 +3284,237 @@ def generate_html(results: List[dict], args: argparse.Namespace) -> str:
         .replace("<<<METRIC2_COL_CLASS>>>", "" if has_second_metric else "hidden-metric")
     )
     return html
+
+
+# ---------------------------------------------------------------------------
+# Local report server (Safari-friendly media playback)
+# ---------------------------------------------------------------------------
+
+_MIME_BY_EXT = {
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".ogv": "video/ogg",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".opus": "audio/opus",
+}
+
+
+def path_from_file_url(url: str) -> Path:
+    """Convert a file:// URL to a filesystem Path."""
+    parsed = urlparse(url)
+    path = unquote(parsed.path)
+    # urlparse("file:///C:/x") on Windows yields "/C:/x"; strip the extra slash.
+    if sys.platform == "win32" and re.match(r"^/[A-Za-z]:/", path):
+        path = path[1:]
+    return Path(path)
+
+
+def guess_media_type(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext in _MIME_BY_EXT:
+        return _MIME_BY_EXT[ext]
+    guessed, _ = mimetypes.guess_type(str(path))
+    return guessed or "application/octet-stream"
+
+
+def extract_media_paths_from_report(html: str) -> List[Path]:
+    """Pull per-row filesystem paths out of a generated report's DATA blob."""
+    match = re.search(r"const DATA\s*=\s*(\[.*?\]);", html, re.S)
+    if not match:
+        raise ValueError("Could not find DATA array in report HTML")
+    data = json.loads(match.group(1))
+    paths: List[Path] = []
+    for item in data:
+        raw_path = item.get("path")
+        if raw_path:
+            paths.append(Path(str(raw_path)))
+            continue
+        url = str(item.get("url") or "")
+        if url.startswith("file:"):
+            paths.append(path_from_file_url(url))
+            continue
+        raise ValueError(
+            f"Report entry {item.get('name')!r} has no filesystem path; "
+            "re-generate the report with a current screamfinder.py"
+        )
+    return paths
+
+
+def _parse_byte_range(range_header: str, size: int) -> Optional[Tuple[int, int]]:
+    """Parse a single-range Range header into inclusive (start, end) byte indexes."""
+    if not range_header or "," in range_header:
+        return None
+    match = re.match(r"bytes=(\d*)-(\d*)$", range_header.strip())
+    if not match:
+        return None
+    start_s, end_s = match.group(1), match.group(2)
+    if start_s == "" and end_s == "":
+        return None
+    if start_s == "":
+        # suffix range: last N bytes
+        length = int(end_s)
+        if length <= 0:
+            return None
+        start = max(size - length, 0)
+        end = size - 1
+    else:
+        start = int(start_s)
+        end = int(end_s) if end_s else size - 1
+        if start >= size:
+            return None
+        end = min(end, size - 1)
+        if end < start:
+            return None
+    return start, end
+
+
+def rewrite_report_media_urls(html: str) -> str:
+    """Point DATA[].url at /media/<idx> so file:// URLs are not used over HTTP."""
+    match = re.search(r"const DATA\s*=\s*(\[.*?\]);", html, re.S)
+    if not match:
+        return html
+    data = json.loads(match.group(1))
+    for idx, item in enumerate(data):
+        item["url"] = f"/media/{idx}"
+    return html[: match.start(1)] + json.dumps(data, ensure_ascii=True) + html[match.end(1) :]
+
+
+class _ReportHandler(BaseHTTPRequestHandler):
+    """Serve the HTML report and allowlisted media with HTTP Range support."""
+
+    html_path: Path = Path(".")
+    media_paths: Sequence[Path] = ()
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        # Keep the terminal quiet unless something fails.
+        if args and len(args) >= 2 and str(args[1]).startswith(("4", "5")):
+            super().log_message(fmt, *args)
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        self._handle(send_body=False)
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._handle(send_body=True)
+
+    def _handle(self, send_body: bool) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path in ("/", "/index.html", "/report.html"):
+            html = rewrite_report_media_urls(
+                self.html_path.read_text(encoding="utf-8")
+            )
+            data = html.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            if send_body:
+                try:
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+            return
+        if path.startswith("/media/"):
+            token = path[len("/media/"):]
+            if not token.isdigit():
+                self.send_error(404, "Not Found")
+                return
+            idx = int(token)
+            if idx < 0 or idx >= len(self.media_paths):
+                self.send_error(404, "Not Found")
+                return
+            media = self.media_paths[idx]
+            if not media.is_file():
+                self.send_error(404, f"Missing media: {media.name}")
+                return
+            self._send_media(media, send_body)
+            return
+        self.send_error(404, "Not Found")
+
+    def _send_media(self, file_path: Path, send_body: bool) -> None:
+        size = file_path.stat().st_size
+        content_type = guess_media_type(file_path)
+        range_header = self.headers.get("Range")
+        byte_range = _parse_byte_range(range_header, size) if range_header else None
+
+        if range_header and byte_range is None:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.end_headers()
+            return
+
+        if byte_range is None:
+            start, end = 0, size - 1 if size else 0
+            status = 200
+        else:
+            start, end = byte_range
+            status = 206
+
+        length = (end - start + 1) if size else 0
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Cache-Control", "private, max-age=0")
+        self.end_headers()
+        if not send_body or length <= 0:
+            return
+        try:
+            with file_path.open("rb") as fh:
+                fh.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = fh.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+
+def serve_report(
+    html_path: Path,
+    media_paths: Sequence[Path],
+    port: int = 8765,
+    open_browser: bool = True,
+) -> None:
+    """Serve a report over localhost so Safari can play media outside the report folder."""
+    html_path = html_path.resolve()
+    if not html_path.is_file():
+        raise FileNotFoundError(f"Report not found: {html_path}")
+
+    handler = type(
+        "BoundReportHandler",
+        (_ReportHandler,),
+        {
+            "html_path": html_path,
+            "media_paths": list(media_paths),
+        },
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    url = f"http://127.0.0.1:{port}/"
+    print(f"Serving report at {url}", file=sys.stderr)
+    print("Press Ctrl+C to stop.", file=sys.stderr)
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.", file=sys.stderr)
+    finally:
+        server.server_close()
 
 
 # ---------------------------------------------------------------------------
@@ -3309,8 +3562,8 @@ def load_config(config_path: Path) -> Dict[str, object]:
         "yamnet_context_rms_seconds",
         "yamnet_context_rms_ratio",
     )
-    int_keys   = ("sample_rate", "jobs", "n_fft", "hop_length", "yamnet_top_k")
-    bool_keys  = ("no_cache", "force")
+    int_keys   = ("sample_rate", "jobs", "n_fft", "hop_length", "yamnet_top_k", "port")
+    bool_keys  = ("no_cache", "force", "serve")
 
     for k in str_keys:
         if k in data:
@@ -3371,7 +3624,7 @@ def main() -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "paths", nargs="+", metavar="PATH",
+        "paths", nargs="*", metavar="PATH",
         help="Media file(s) (video or audio) and/or directory(s) to analyze",
     )
     parser.add_argument(
@@ -3381,6 +3634,19 @@ def main() -> None:
     parser.add_argument(
         "-o", "--output", default="screamfinder.html", metavar="FILE",
         help="Output HTML file",
+    )
+    parser.add_argument(
+        "--serve", action="store_true",
+        help="After writing the report, serve it on localhost and open a browser "
+             "(required for Safari when media lives outside the report folder)",
+    )
+    parser.add_argument(
+        "--serve-report", metavar="FILE", default="",
+        help="Serve an existing HTML report on localhost (no re-analysis) and open a browser",
+    )
+    parser.add_argument(
+        "--port", type=int, default=8765, metavar="N",
+        help="Port for --serve / --serve-report",
     )
     parser.add_argument(
         "--segments-json", default="", metavar="FILE",
@@ -3490,6 +3756,20 @@ def main() -> None:
         parser.set_defaults(**config_defaults)
 
     args = parser.parse_args()
+
+    if args.serve_report:
+        report_path = Path(args.serve_report)
+        try:
+            html_text = report_path.read_text(encoding="utf-8")
+            media_paths = extract_media_paths_from_report(html_text)
+        except Exception as exc:
+            print(f"ERROR: could not serve report: {exc}", file=sys.stderr)
+            sys.exit(1)
+        serve_report(report_path, media_paths, port=args.port)
+        return
+
+    if not args.paths:
+        parser.error("PATH is required unless --serve-report is used")
 
     # Validate
     args.female_freq = tuple(args.female_freq)  # type: ignore[assignment]
@@ -3646,7 +3926,18 @@ def main() -> None:
     output_path.write_text(html, encoding="utf-8")
     abs_path = output_path.resolve()
     print(f"\nReport written to: {abs_path}", file=sys.stderr)
-    print(f"Open in browser:  file://{abs_path}", file=sys.stderr)
+    if args.serve:
+        print(
+            f"Serving for Safari-compatible playback on http://127.0.0.1:{args.port}/",
+            file=sys.stderr,
+        )
+    else:
+        print(f"Open in browser:  file://{abs_path}", file=sys.stderr)
+        print(
+            "Safari tip: use --serve (or --serve-report) so media outside the "
+            "report folder can play.",
+            file=sys.stderr,
+        )
 
     if args.segments_json:
         segments_path = Path(args.segments_json)
@@ -3656,6 +3947,10 @@ def main() -> None:
         debug_path = Path(args.yamnet_label_debug_json)
         export_yamnet_debug_json(results, debug_path)
         print(f"YAMNet debug:     {debug_path.resolve()}", file=sys.stderr)
+
+    if args.serve:
+        media_paths = [Path(r["path"]) for r in results]
+        serve_report(abs_path, media_paths, port=args.port)
 
 
 if __name__ == "__main__":

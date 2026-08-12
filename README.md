@@ -84,7 +84,17 @@ open report.html          # macOS
 xdg-open report.html      # Linux
 ```
 
-The report opens in any modern browser. No web server required.
+The report opens in any modern browser. Chrome can open the HTML file directly (`file://`). **Safari** blocks media that lives outside the report's folder when using `file://`, so serve it instead:
+
+```bash
+# After analysis
+python3 screamfinder.py ~/Media/ -o report.html --serve
+
+# Or serve an existing report (no re-analysis)
+python3 screamfinder.py --serve-report report.html
+```
+
+That starts a local server at `http://127.0.0.1:8765/` (override with `--port`) and opens your browser.
 
 ---
 
@@ -117,6 +127,8 @@ Audio files (`.mp3`, `.flac`, etc.) play in the same modal: instead of a video f
 
 If a file format isn't supported by the browser (e.g. `.mpg`, `.avi`, `.wma`), an error overlay appears with the file path and a **Copy path** button so you can paste it into VLC, IINA, or another player.
 
+Safari note: opening the HTML via `file://` often cannot play `.mp4` files stored on another volume or folder. Use `--serve` / `--serve-report` so the player loads media over `http://127.0.0.1`.
+
 ---
 
 ## Command-Line Reference
@@ -132,6 +144,9 @@ python3 screamfinder.py [options] PATH [PATH ...]
 | Flag | Default | Description |
 |---|---|---|
 | `-o FILE`, `--output FILE` | `screamfinder.html` | Output HTML file |
+| `--serve` | off | After writing the report, serve it on localhost and open a browser (needed for Safari when media is outside the report folder) |
+| `--serve-report FILE` | off | Serve an existing HTML report on localhost (no re-analysis) |
+| `--port N` | `8765` | Port for `--serve` / `--serve-report` |
 | `--segments-json FILE` | off | Optional JSON export with per-file detected segments and timestamps |
 | `--config FILE` | `screamfinder.toml` | TOML config file (CLI args override) |
 | `--jobs N` | `4` | Parallel analysis workers |
